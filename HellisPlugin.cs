@@ -27,6 +27,7 @@ namespace Oxide.Plugins
         private HashSet<ulong> activeJoinButtons = new HashSet<ulong>(); // Track players with join button
         private HashSet<ulong> activeLeaveButtons = new HashSet<ulong>(); // Track players with leave button
         private HashSet<ulong> autoRequeueOptOut = new HashSet<ulong>(); // Track players who opted out of auto-requeue
+        private HashSet<ulong> activeJoinRequestUIs = new HashSet<ulong>(); // Track players with pending-request overlay open
         private List<ArenaConfig> arenas = new List<ArenaConfig>(); // Arena storage (stored in data file, not config)
         
         // Lobby browser system
@@ -438,8 +439,10 @@ namespace Oxide.Plugins
             }
             
             // Clean up UIs
-            DestroyLobbyBrowser(player); // Phase 2: Use lobby browser
+            DestroyLobbyBrowser(player);
             DestroyLeaderboardUI(player);
+            DestroyJoinRequestUI(player);
+            CuiHelper.DestroyUi(player, "RoomGunSelect");
         }
         
         private void OnPlayerConnected(BasePlayer player)
@@ -1065,15 +1068,24 @@ namespace Oxide.Plugins
             ProcessAllQueues();
         }
         
-        private void StartDuel(BasePlayer player1, BasePlayer player2, DuelMode mode)
+        private void StartDuel(BasePlayer player1, BasePlayer player2, DuelMode mode, string roomID = null)
         {
             var arena = arenaManager.GetAvailableArena();
             if (arena == null)
             {
                 SendReply(player1, "No arenas available. Please wait.");
                 SendReply(player2, "No arenas available. Please wait.");
-                queueManager.JoinQueue(player1.userID, player1.displayName, mode);
-                queueManager.JoinQueue(player2.userID, player2.displayName, mode);
+                if (roomID != null && privateRooms.ContainsKey(roomID))
+                {
+                    // Re-add to room waiting queue on failure
+                    privateRooms[roomID].WaitingQueue.Add(player1.userID);
+                    privateRooms[roomID].WaitingQueue.Add(player2.userID);
+                }
+                else
+                {
+                    queueManager.JoinQueue(player1.userID, player1.displayName, mode);
+                    queueManager.JoinQueue(player2.userID, player2.displayName, mode);
+                }
                 return;
             }
             
@@ -1083,12 +1095,21 @@ namespace Oxide.Plugins
             {
                 SendReply(player1, "No arena instances available. Please wait.");
                 SendReply(player2, "No arena instances available. Please wait.");
-                queueManager.JoinQueue(player1.userID, player1.displayName, mode);
-                queueManager.JoinQueue(player2.userID, player2.displayName, mode);
+                if (roomID != null && privateRooms.ContainsKey(roomID))
+                {
+                    privateRooms[roomID].WaitingQueue.Add(player1.userID);
+                    privateRooms[roomID].WaitingQueue.Add(player2.userID);
+                }
+                else
+                {
+                    queueManager.JoinQueue(player1.userID, player1.displayName, mode);
+                    queueManager.JoinQueue(player2.userID, player2.displayName, mode);
+                }
                 return;
             }
             
             var match = new ActiveMatch(player1.userID, player2.userID, mode, arena, instanceId, config.BestOfRounds);
+            match.RoomID = roomID;
             activeMatches[player1.userID] = match;
             activeMatches[player2.userID] = match;
             
@@ -1215,6 +1236,9 @@ namespace Oxide.Plugins
             UpdatePlayerStats(match.Player1ID, winnerID == match.Player1ID, match);
             UpdatePlayerStats(match.Player2ID, winnerID == match.Player2ID, match);
             
+            // Capture room context before removing from active matches
+            string matchRoomID = match.RoomID;
+            
             // Notify players
             if (player1 != null)
             {
@@ -1232,10 +1256,20 @@ namespace Oxide.Plugins
                     ShowWinLoseUI(player1, player1Won, match.Player1Score, match.Player2Score);
                 }
                 
-                // Return to spawn or re-queue
+                // Return to spawn
                 ReturnPlayerToLobby(player1);
                 
-                if (config.AutoRequeue && !disconnect && !autoRequeueOptOut.Contains(player1.userID))
+                // For room matches, re-add to room waiting queue; otherwise standard auto-requeue
+                if (matchRoomID != null && privateRooms.ContainsKey(matchRoomID))
+                {
+                    var room = privateRooms[matchRoomID];
+                    if (room.PlayerIDs.Contains(match.Player1ID))
+                    {
+                        room.WaitingQueue.Add(match.Player1ID);
+                        SendReply(player1, $"Back in {room.RoomName}'s room queue. Waiting for next match...");
+                    }
+                }
+                else if (config.AutoRequeue && !disconnect && !autoRequeueOptOut.Contains(player1.userID))
                 {
                     queueManager.JoinQueue(player1.userID, player1.displayName, DuelMode.Any);
                     SendReply(player1, "✓ Auto-requeued for random match!");
@@ -1264,7 +1298,16 @@ namespace Oxide.Plugins
                 
                 ReturnPlayerToLobby(player2);
                 
-                if (config.AutoRequeue && !disconnect && !autoRequeueOptOut.Contains(player2.userID))
+                if (matchRoomID != null && privateRooms.ContainsKey(matchRoomID))
+                {
+                    var room = privateRooms[matchRoomID];
+                    if (room.PlayerIDs.Contains(match.Player2ID))
+                    {
+                        room.WaitingQueue.Add(match.Player2ID);
+                        SendReply(player2, $"Back in {room.RoomName}'s room queue. Waiting for next match...");
+                    }
+                }
+                else if (config.AutoRequeue && !disconnect && !autoRequeueOptOut.Contains(player2.userID))
                 {
                     queueManager.JoinQueue(player2.userID, player2.displayName, DuelMode.Any);
                     SendReply(player2, "✓ Auto-requeued for random match!");
@@ -1282,18 +1325,37 @@ namespace Oxide.Plugins
             activeMatches.Remove(match.Player1ID);
             activeMatches.Remove(match.Player2ID);
             
+            // For room matches, try to start the next match from the waiting queue
+            if (matchRoomID != null && privateRooms.ContainsKey(matchRoomID))
+            {
+                timer.Once(1.5f, () => TryRoomMatchmaking(matchRoomID));
+            }
+            
             // Refresh UI for both players
             timer.Once(0.5f, () =>
             {
                 if (player1 != null && player1.IsConnected)
                 {
                     DestroyLeaveButton(player1);
-                    ShowLobbyBrowser(player1); // Show lobby browser instead
+                    ShowLobbyBrowser(player1);
+                    // Show pending join requests to room owner after match
+                    var ownedRoomID = GetOwnedRoom(player1.userID);
+                    if (ownedRoomID != null && privateRooms.ContainsKey(ownedRoomID) &&
+                        privateRooms[ownedRoomID].PendingRequests.Count > 0)
+                    {
+                        ShowJoinRequestUI(player1, ownedRoomID);
+                    }
                 }
                 if (player2 != null && player2.IsConnected)
                 {
                     DestroyLeaveButton(player2);
-                    ShowLobbyBrowser(player2); // Show lobby browser instead
+                    ShowLobbyBrowser(player2);
+                    var ownedRoomID = GetOwnedRoom(player2.userID);
+                    if (ownedRoomID != null && privateRooms.ContainsKey(ownedRoomID) &&
+                        privateRooms[ownedRoomID].PendingRequests.Count > 0)
+                    {
+                        ShowJoinRequestUI(player2, ownedRoomID);
+                    }
                 }
             });
             
@@ -1827,17 +1889,17 @@ namespace Oxide.Plugins
                 RectTransform = { AnchorMin = $"0.05 {privateStartY - 0.005f}", AnchorMax = $"0.95 {privateStartY}" }
             }, "LobbyBrowser");
             
-            // Private room listings — cap at 2 entries to keep CREATE ROOM button visible
+            // Private room listings — show up to 4 rooms
             float roomY = privateStartY - 0.08f;
             int roomCount = 0;
-            foreach (var room in privateRooms.Values.Take(2))
+            foreach (var room in privateRooms.Values.Take(4))
             {
-                AddRoomEntry(elements, "LobbyBrowser", room, roomY);
-                roomY -= 0.07f;
+                AddRoomEntry(elements, "LobbyBrowser", room, roomY, player.userID);
+                roomY -= 0.08f;
                 roomCount++;
             }
             
-            // If no rooms, show message
+            // If no rooms, show placeholder
             if (roomCount == 0)
             {
                 elements.Add(new CuiLabel
@@ -1847,13 +1909,20 @@ namespace Oxide.Plugins
                 }, "LobbyBrowser");
             }
             
-            // "CREATE ROOM +" button at bottom
+            // "CREATE ROOM +" button — auto-names the room after the player's username
             float createButtonY = 0.05f;
+            
+            // Show CREATE ROOM button only if viewer doesn't already own a room
+            bool ownsRoom = privateRooms.Values.Any(r => r.OwnerID == player.userID);
+            string createBtnText = ownsRoom ? "YOU HAVE A ROOM" : "CREATE ROOM +";
+            string createBtnColor = ownsRoom ? "0.3 0.3 0.3 0.6" : "0 0.8 0.82 0.8";
+            string createBtnCmd = ownsRoom ? "" : "lobby.createroom";
+            
             elements.Add(new CuiButton
             {
-                Button = { Command = "lobby.createroom", Color = "0 0.8 0.82 0.8" }, // Cyan button
+                Button = { Command = createBtnCmd, Color = createBtnColor },
                 RectTransform = { AnchorMin = $"0.10 {createButtonY}", AnchorMax = $"0.90 {createButtonY + 0.06f}" },
-                Text = { Text = "CREATE ROOM +", FontSize = 14, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                Text = { Text = createBtnText, FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
             }, "LobbyBrowser");
             
             CuiHelper.AddUi(player, elements);
@@ -1892,37 +1961,243 @@ namespace Oxide.Plugins
             }, entryName);
         }
         
-        private void AddRoomEntry(CuiElementContainer elements, string parent, PrivateRoom room, float yPos)
+        private void AddRoomEntry(CuiElementContainer elements, string parent, PrivateRoom room, float yPos, ulong viewerID)
         {
-            // Background panel for room entry
+            // Background panel for room entry (taller to accommodate mode label + buttons)
             string entryName = $"{parent}.Room.{room.RoomID}";
             elements.Add(new CuiPanel
             {
                 Image = { Color = "0.12 0.12 0.12 0.8" },
-                RectTransform = { AnchorMin = $"0.05 {yPos}", AnchorMax = $"0.95 {yPos + 0.06f}" }
+                RectTransform = { AnchorMin = $"0.05 {yPos}", AnchorMax = $"0.95 {yPos + 0.07f}" }
             }, parent, entryName);
             
-            // Room info: "(X) PlayerName"
-            string roomText = $"({room.PlayerIDs.Count}) {room.OwnerName}";
+            // Room name: "OwnerName's Room (X)"
+            string roomText = $"{room.OwnerName} ({room.PlayerIDs.Count})";
             elements.Add(new CuiLabel
             {
                 Text = { Text = roomText, FontSize = 12, Align = TextAnchor.MiddleLeft, Color = "1 1 1 1" },
-                RectTransform = { AnchorMin = "0.05 0", AnchorMax = "0.60 1" }
+                RectTransform = { AnchorMin = "0.05 0.50", AnchorMax = "0.55 1" }
             }, entryName);
             
-            // JOIN button
-            elements.Add(new CuiButton
+            // Mode label
+            elements.Add(new CuiLabel
             {
-                Button = { Command = $"lobby.joinroom {room.RoomID}", Color = "0 0.8 0.82 1" },
-                RectTransform = { AnchorMin = "0.70 0.15", AnchorMax = "0.95 0.85" },
-                Text = { Text = "JOIN", FontSize = 11, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                Text = { Text = $"[{room.Mode}]", FontSize = 10, Align = TextAnchor.MiddleLeft, Color = "0 0.8 0.82 1" },
+                RectTransform = { AnchorMin = "0.05 0.05", AnchorMax = "0.45 0.50" }
             }, entryName);
+            
+            bool isOwner = viewerID == room.OwnerID;
+            bool isMember = room.PlayerIDs.Contains(viewerID);
+            bool hasPending = room.PendingRequests.ContainsKey(viewerID);
+            
+            if (isOwner)
+            {
+                // Owner: GUNS button + LEAVE button
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = "lobby.roomguns", Color = "0.25 0.35 0.75 0.9" },
+                    RectTransform = { AnchorMin = "0.55 0.15", AnchorMax = "0.74 0.85" },
+                    Text = { Text = "GUNS", FontSize = 10, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                }, entryName);
+                
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = "lobby.leaveroom", Color = "0.7 0.2 0.1 0.9" },
+                    RectTransform = { AnchorMin = "0.76 0.15", AnchorMax = "0.95 0.85" },
+                    Text = { Text = "LEAVE", FontSize = 10, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                }, entryName);
+                
+                // Show pending request badge
+                if (room.PendingRequests.Count > 0)
+                {
+                    elements.Add(new CuiLabel
+                    {
+                        Text = { Text = $"▲ {room.PendingRequests.Count} request(s)", FontSize = 9, Align = TextAnchor.MiddleRight, Color = "1 0.7 0.1 1" },
+                        RectTransform = { AnchorMin = "0.45 0.05", AnchorMax = "0.97 0.50" }
+                    }, entryName);
+                }
+            }
+            else if (isMember)
+            {
+                // Member: LEAVE button
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = "lobby.leaveroom", Color = "0.7 0.2 0.1 0.9" },
+                    RectTransform = { AnchorMin = "0.76 0.15", AnchorMax = "0.95 0.85" },
+                    Text = { Text = "LEAVE", FontSize = 10, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                }, entryName);
+            }
+            else if (hasPending)
+            {
+                // Has a pending request — show greyed out indicator
+                elements.Add(new CuiLabel
+                {
+                    Text = { Text = "PENDING...", FontSize = 9, Align = TextAnchor.MiddleCenter, Color = "0.7 0.7 0.1 1" },
+                    RectTransform = { AnchorMin = "0.65 0.15", AnchorMax = "0.95 0.85" }
+                }, entryName);
+            }
+            else
+            {
+                // Non-member: REQUEST button
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = $"lobby.requestjoin {room.RoomID}", Color = "0 0.8 0.82 1" },
+                    RectTransform = { AnchorMin = "0.68 0.15", AnchorMax = "0.95 0.85" },
+                    Text = { Text = "REQUEST", FontSize = 10, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                }, entryName);
+            }
         }
         
         private void DestroyLobbyBrowser(BasePlayer player)
         {
             if (player == null) return;
             CuiHelper.DestroyUi(player, "LobbyBrowser");
+        }
+        
+        private void ShowJoinRequestUI(BasePlayer owner, string roomID)
+        {
+            if (owner == null || !owner.IsConnected || !privateRooms.ContainsKey(roomID)) return;
+            
+            // Don't interrupt an active match
+            if (activeMatches.ContainsKey(owner.userID)) return;
+            
+            var room = privateRooms[roomID];
+            
+            DestroyJoinRequestUI(owner);
+            
+            if (room.PendingRequests.Count == 0) return;
+            
+            var elements = new CuiElementContainer();
+            
+            // Panel sits at top-center, height depends on number of requests (up to 3)
+            int shown = Math.Min(room.PendingRequests.Count, 3);
+            float panelH = 0.07f + shown * 0.09f;
+            float panelBottom = 0.98f - panelH;
+            
+            elements.Add(new CuiPanel
+            {
+                Image = { Color = "0.13 0.13 0.13 0.97" },
+                RectTransform = { AnchorMin = $"0.30 {panelBottom:F4}", AnchorMax = "0.70 0.98" },
+                CursorEnabled = false
+            }, "Hud", "JoinRequestUI");
+            
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = "JOIN REQUESTS", FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "0 0.8 0.82 1" },
+                RectTransform = { AnchorMin = "0 0.86", AnchorMax = "1 1" }
+            }, "JoinRequestUI");
+            
+            float rowY = 0.84f;
+            int count = 0;
+            foreach (var kvp in room.PendingRequests)
+            {
+                if (count >= 3) break;
+                ulong requesterID = kvp.Key;
+                string requesterName = kvp.Value;
+                
+                string rowName = $"JoinRequestUI.Row.{requesterID}";
+                elements.Add(new CuiPanel
+                {
+                    Image = { Color = "0.10 0.10 0.10 0.9" },
+                    RectTransform = { AnchorMin = $"0.04 {rowY - 0.24f:F4}", AnchorMax = $"0.96 {rowY:F4}" }
+                }, "JoinRequestUI", rowName);
+                
+                elements.Add(new CuiLabel
+                {
+                    Text = { Text = requesterName, FontSize = 11, Align = TextAnchor.MiddleLeft, Color = "1 1 1 1" },
+                    RectTransform = { AnchorMin = "0.05 0", AnchorMax = "0.50 1" }
+                }, rowName);
+                
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = $"lobby.accept {requesterID}", Color = "0.1 0.65 0.1 0.9" },
+                    RectTransform = { AnchorMin = "0.52 0.12", AnchorMax = "0.74 0.88" },
+                    Text = { Text = "ACCEPT", FontSize = 10, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                }, rowName);
+                
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = $"lobby.decline {requesterID}", Color = "0.65 0.1 0.1 0.9" },
+                    RectTransform = { AnchorMin = "0.76 0.12", AnchorMax = "0.96 0.88" },
+                    Text = { Text = "DECLINE", FontSize = 10, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                }, rowName);
+                
+                rowY -= 0.28f;
+                count++;
+            }
+            
+            CuiHelper.AddUi(owner, elements);
+            activeJoinRequestUIs.Add(owner.userID);
+        }
+        
+        private void DestroyJoinRequestUI(BasePlayer player)
+        {
+            if (player == null) return;
+            CuiHelper.DestroyUi(player, "JoinRequestUI");
+            activeJoinRequestUIs.Remove(player.userID);
+        }
+        
+        private void ShowGunSelectUI(BasePlayer player, string roomID)
+        {
+            if (player == null || !privateRooms.ContainsKey(roomID)) return;
+            var room = privateRooms[roomID];
+            if (room.OwnerID != player.userID) return;
+            
+            CuiHelper.DestroyUi(player, "RoomGunSelect");
+            
+            var elements = new CuiElementContainer();
+            
+            elements.Add(new CuiPanel
+            {
+                Image = { Color = "0.13 0.13 0.13 0.97" },
+                RectTransform = { AnchorMin = "0.38 0.30", AnchorMax = "0.62 0.78" },
+                CursorEnabled = false
+            }, "Hud", "RoomGunSelect");
+            
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = "SELECT WEAPON MODE", FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "0 0.8 0.82 1" },
+                RectTransform = { AnchorMin = "0 0.88", AnchorMax = "1 1" }
+            }, "RoomGunSelect");
+            
+            var modeList = new List<(string Label, DuelMode Mode)>
+            {
+                ("AK47", DuelMode.AK47),
+                ("SAR", DuelMode.SAR),
+                ("Bow", DuelMode.Bow),
+                ("Revolver", DuelMode.Revolver),
+            };
+            if (config.EnableSpeargun)
+                modeList.Add(("Speargun", DuelMode.Speargun));
+            
+            float btnY = 0.84f;
+            float btnH = 0.12f;
+            float gap = 0.02f;
+            foreach (var (label, mode) in modeList)
+            {
+                bool selected = room.Mode == mode;
+                string btnColor = selected ? "0.1 0.55 0.1 0.95" : "0.22 0.22 0.22 0.95";
+                string checkmark = selected ? " ✓" : "";
+                
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = $"lobby.roomsetmode {mode}", Color = btnColor },
+                    RectTransform = { AnchorMin = $"0.08 {btnY - btnH:F4}", AnchorMax = $"0.92 {btnY:F4}" },
+                    Text = { Text = $"{label}{checkmark}", FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                }, "RoomGunSelect");
+                
+                btnY -= btnH + gap;
+            }
+            
+            // CLOSE button
+            elements.Add(new CuiButton
+            {
+                Button = { Command = "lobby.closeguns", Color = "0.55 0.1 0.1 0.9" },
+                RectTransform = { AnchorMin = "0.08 0.02", AnchorMax = "0.92 0.10" },
+                Text = { Text = "CLOSE", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+            }, "RoomGunSelect");
+            
+            CuiHelper.AddUi(player, elements);
         }
         
         // ============================================
@@ -2095,33 +2370,49 @@ namespace Oxide.Plugins
         {
             var player = arg.Player();
             if (player == null) return;
-            
-            if (arg.Args == null || arg.Args.Length == 0)
-            {
-                SendReply(player, "Usage: lobby.createroom <roomName>");
-                SendReply(player, "Example: lobby.createroom My Epic Room");
-                return;
-            }
-            
-            var roomName = string.Join(" ", arg.Args);
-            CreateRoom(player, roomName);
+            // Room is auto-named after the player — no arguments needed
+            CreateRoom(player);
         }
         
+        // lobby.joinroom kept as alias → forwards to the request flow
         [ConsoleCommand("lobby.joinroom")]
         private void JoinRoomCommand(ConsoleSystem.Arg arg)
         {
             var player = arg.Player();
             if (player == null) return;
-            
-            if (arg.Args == null || arg.Args.Length == 0)
-            {
-                SendReply(player, "Usage: lobby.joinroom <roomID>");
-                SendReply(player, "Example: lobby.joinroom A7K3M9");
-                return;
-            }
-            
-            var roomID = arg.Args[0].ToUpper();
-            JoinRoom(player, roomID);
+            if (arg.Args == null || arg.Args.Length == 0) return;
+            RequestJoinRoom(player, arg.Args[0]);
+        }
+        
+        [ConsoleCommand("lobby.requestjoin")]
+        private void RequestJoinRoomCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+            if (arg.Args == null || arg.Args.Length == 0) return;
+            RequestJoinRoom(player, arg.Args[0]);
+        }
+        
+        [ConsoleCommand("lobby.accept")]
+        private void AcceptJoinCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null || arg.Args == null || arg.Args.Length == 0) return;
+            if (!ulong.TryParse(arg.Args[0], out ulong requesterID)) return;
+            var roomID = GetOwnedRoom(player.userID);
+            if (roomID == null) return;
+            AcceptJoinRequest(player, requesterID, roomID);
+        }
+        
+        [ConsoleCommand("lobby.decline")]
+        private void DeclineJoinCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null || arg.Args == null || arg.Args.Length == 0) return;
+            if (!ulong.TryParse(arg.Args[0], out ulong requesterID)) return;
+            var roomID = GetOwnedRoom(player.userID);
+            if (roomID == null) return;
+            DeclineJoinRequest(player.userID, requesterID, roomID);
         }
         
         [ConsoleCommand("lobby.leaveroom")]
@@ -2146,14 +2437,46 @@ namespace Oxide.Plugins
             var player = arg.Player();
             if (player == null) return;
             
-            var roomID = GetPlayerRoom(player.userID);
+            var roomID = GetOwnedRoom(player.userID);
             if (roomID == null)
             {
-                SendReply(player, "You're not in any room!");
+                SendReply(player, "You need to own a room to start a match!");
                 return;
             }
             
-            StartRoomMatch(player, roomID);
+            TryRoomMatchmaking(roomID);
+        }
+        
+        [ConsoleCommand("lobby.roomguns")]
+        private void RoomGunsCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+            var roomID = GetOwnedRoom(player.userID);
+            if (roomID == null)
+            {
+                SendReply(player, "You need to own a room to change its weapon mode!");
+                return;
+            }
+            ShowGunSelectUI(player, roomID);
+        }
+        
+        [ConsoleCommand("lobby.roomsetmode")]
+        private void RoomSetModeCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null || arg.Args == null || arg.Args.Length == 0) return;
+            var roomID = GetOwnedRoom(player.userID);
+            if (roomID == null) return;
+            SetRoomMode(player, roomID, arg.Args[0]);
+        }
+        
+        [ConsoleCommand("lobby.closeguns")]
+        private void CloseGunsCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+            CuiHelper.DestroyUi(player, "RoomGunSelect");
         }
         
         #endregion
@@ -2306,16 +2629,9 @@ namespace Oxide.Plugins
         
         #region Phase 4 - Private Rooms
         
-        private void CreateRoom(BasePlayer player, string roomName)
+        private void CreateRoom(BasePlayer player)
         {
             if (player == null) return;
-            
-            // Validate room name
-            if (string.IsNullOrWhiteSpace(roomName) || roomName.Length < 3 || roomName.Length > 20)
-            {
-                SendReply(player, "Room name must be between 3 and 20 characters!");
-                return;
-            }
             
             // Check if player is already in a match
             if (activeMatches.Values.Any(d => d.Player1ID == player.userID || d.Player2ID == player.userID))
@@ -2324,209 +2640,352 @@ namespace Oxide.Plugins
                 return;
             }
             
-            // Check if player is already in a room
-            var existingRoom = GetPlayerRoom(player.userID);
-            if (existingRoom != null)
+            // Prevent duplicate rooms
+            if (privateRooms.Values.Any(r => r.OwnerID == player.userID))
             {
-                SendReply(player, "You're already in a room! Leave it first with /lobby.leaveroom");
+                SendReply(player, "You already own a room! Leave it first.");
                 return;
             }
             
-            // Generate unique room ID
-            string roomID;
-            do
+            // Prevent joining if already in another room
+            var existingRoom = GetPlayerRoom(player.userID);
+            if (existingRoom != null)
+            {
+                SendReply(player, "You're already in a room! Leave it first.");
+                return;
+            }
+            
+            // Generate unique short room ID (max 20 attempts before giving up)
+            string roomID = GenerateRoomID();
+            int idAttempts = 0;
+            while (privateRooms.ContainsKey(roomID) && idAttempts < 20)
             {
                 roomID = GenerateRoomID();
-            } while (privateRooms.ContainsKey(roomID));
+                idAttempts++;
+            }
+            if (privateRooms.ContainsKey(roomID))
+            {
+                SendReply(player, "Could not generate a unique room ID. Please try again.");
+                return;
+            }
             
-            // Create the room
+            // Room is named after the creator's display name
             var room = new PrivateRoom
             {
                 RoomID = roomID,
-                RoomName = roomName,
+                RoomName = player.displayName,
                 OwnerID = player.userID,
                 OwnerName = player.displayName,
                 PlayerIDs = new List<ulong> { player.userID },
-                MaxPlayers = 2,
-                Mode = DuelMode.AK47, // Default, can be changed
+                WaitingQueue = new List<ulong> { player.userID },
+                Mode = DuelMode.AK47,
                 Created = DateTime.Now
             };
             
             privateRooms[roomID] = room;
             
-            // Remove from queue if queued
+            // Remove from any public queue
             LeaveQueueInternal(player, false);
             
-            SendReply(player, $"Room '{roomName}' created with ID: {roomID}");
-            SendReply(player, $"Share this ID with friends: {roomID}");
-            SendReply(player, "Start match when 2 players with: /lobby.startmatch");
+            SendReply(player, $"Room created! Others can request to join from the lobby.");
+            SendReply(player, "Use the GUNS button to choose a weapon mode.");
             
-            // Update UI for all players
             UpdateRoomsList();
         }
         
-        private void JoinRoom(BasePlayer player, string roomID)
+        private void RequestJoinRoom(BasePlayer player, string roomID)
         {
             if (player == null || string.IsNullOrWhiteSpace(roomID)) return;
             
-            // Check if room exists
             if (!privateRooms.ContainsKey(roomID))
             {
-                SendReply(player, $"Room {roomID} does not exist!");
+                SendReply(player, "That room does not exist!");
                 return;
             }
             
             var room = privateRooms[roomID];
             
-            // Check if player is already in a match
             if (activeMatches.Values.Any(d => d.Player1ID == player.userID || d.Player2ID == player.userID))
             {
-                SendReply(player, "You cannot join a room while in a match!");
+                SendReply(player, "You cannot request to join a room while in a match!");
                 return;
             }
             
-            // Check if player is already in this room
-            if (room.PlayerIDs.Contains(player.userID))
+            if (room.HasPlayer(player.userID))
             {
                 SendReply(player, "You're already in this room!");
                 return;
             }
             
-            // Check if player is in another room
+            if (room.HasPendingRequest(player.userID))
+            {
+                SendReply(player, "You've already sent a join request to this room!");
+                return;
+            }
+            
             var existingRoom = GetPlayerRoom(player.userID);
             if (existingRoom != null)
             {
-                SendReply(player, "You're already in another room! Leave it first with /lobby.leaveroom");
+                SendReply(player, "You're already in another room! Leave it first.");
                 return;
             }
             
-            // Check if room is full
-            if (room.IsFull())
+            // Add to pending requests
+            room.PendingRequests[player.userID] = player.displayName;
+            
+            SendReply(player, $"Join request sent to {room.OwnerName}'s room. Waiting for approval (15s)...");
+            
+            // Notify owner via overlay UI (only if not in a match)
+            var owner = BasePlayer.FindByID(room.OwnerID);
+            if (owner != null && owner.IsConnected)
             {
-                SendReply(player, $"Room '{room.RoomName}' is full!");
-                return;
+                ShowJoinRequestUI(owner, roomID);
             }
             
-            // Remove from queue if queued
-            LeaveQueueInternal(player, false);
+            // Update the lobby for all (shows PENDING state on the button for requester)
+            UpdateRoomsList();
             
-            // Add player to room
-            room.PlayerIDs.Add(player.userID);
-            
-            SendReply(player, $"Joined room '{room.RoomName}' ({room.PlayerIDs.Count}/{room.MaxPlayers})");
-            
-            // Notify all room members
-            foreach (var playerID in room.PlayerIDs)
+            // Auto-decline after 15 seconds if owner hasn't responded
+            ulong requesterID = player.userID;
+            timer.Once(15f, () =>
             {
-                var p = BasePlayer.FindByID(playerID);
-                if (p != null && p.userID != player.userID)
+                // Access through dictionary (not captured reference) to avoid stale-object issues
+                if (privateRooms.ContainsKey(roomID) &&
+                    privateRooms[roomID].PendingRequests.ContainsKey(requesterID))
                 {
-                    SendReply(p, $"{player.displayName} joined your room");
+                    DeclineJoinRequest(privateRooms[roomID].OwnerID, requesterID, roomID);
+                }
+            });
+        }
+        
+        private void AcceptJoinRequest(BasePlayer owner, ulong requesterID, string roomID)
+        {
+            if (owner == null || !privateRooms.ContainsKey(roomID)) return;
+            var room = privateRooms[roomID];
+            
+            if (owner.userID != room.OwnerID)
+            {
+                SendReply(owner, "You are not the owner of this room!");
+                return;
+            }
+            
+            if (!room.PendingRequests.ContainsKey(requesterID))
+            {
+                // Request may have already timed out
+                DestroyJoinRequestUI(owner);
+                ShowJoinRequestUI(owner, roomID);
+                return;
+            }
+            
+            string requesterName = room.PendingRequests[requesterID];
+            room.PendingRequests.Remove(requesterID);
+            
+            var requester = BasePlayer.FindByID(requesterID);
+            if (requester == null || !requester.IsConnected)
+            {
+                SendReply(owner, $"{requesterName} is no longer online.");
+                DestroyJoinRequestUI(owner);
+                ShowJoinRequestUI(owner, roomID);
+                return;
+            }
+            
+            // Remove from any public queue
+            LeaveQueueInternal(requester, false);
+            
+            // Add to room
+            room.PlayerIDs.Add(requesterID);
+            room.WaitingQueue.Add(requesterID);
+            
+            SendReply(owner, $"Accepted {requesterName} into your room!");
+            SendReply(requester, $"Your join request was accepted! Welcome to {room.RoomName}'s room.");
+            
+            // Notify other room members
+            foreach (var pid in room.PlayerIDs)
+            {
+                if (pid != owner.userID && pid != requesterID)
+                {
+                    var p = BasePlayer.FindByID(pid);
+                    if (p != null && p.IsConnected)
+                        SendReply(p, $"{requesterName} joined the room.");
                 }
             }
             
-            // Update UI for all players
+            // Refresh request UI (show next pending request or hide if none left)
+            DestroyJoinRequestUI(owner);
+            ShowJoinRequestUI(owner, roomID);
+            
+            // Auto-start match when 2+ players are waiting
+            TryRoomMatchmaking(roomID);
+            
+            UpdateRoomsList();
+        }
+        
+        private void DeclineJoinRequest(ulong ownerID, ulong requesterID, string roomID)
+        {
+            if (!privateRooms.ContainsKey(roomID)) return;
+            var room = privateRooms[roomID];
+            
+            if (!room.PendingRequests.ContainsKey(requesterID)) return;
+            
+            string requesterName = room.PendingRequests[requesterID];
+            room.PendingRequests.Remove(requesterID);
+            
+            var requester = BasePlayer.FindByID(requesterID);
+            if (requester != null && requester.IsConnected)
+                SendReply(requester, $"Your join request to {room.RoomName}'s room was declined.");
+            
+            var owner = BasePlayer.FindByID(ownerID);
+            if (owner != null && owner.IsConnected)
+            {
+                // Refresh request UI (show remaining requests)
+                DestroyJoinRequestUI(owner);
+                ShowJoinRequestUI(owner, roomID);
+            }
+            
+            UpdateRoomsList();
+        }
+        
+        private void TryRoomMatchmaking(string roomID, int depth = 0)
+        {
+            // Guard against infinite recursion when all waiting players are offline
+            if (depth > 10) return;
+            
+            if (!privateRooms.ContainsKey(roomID)) return;
+            var room = privateRooms[roomID];
+            
+            // Clean disconnected players from waiting queue upfront
+            room.WaitingQueue.RemoveAll(id =>
+            {
+                var p = BasePlayer.FindByID(id);
+                return p == null || !p.IsConnected;
+            });
+            
+            if (room.WaitingQueue.Count < 2) return;
+            
+            var p1ID = room.WaitingQueue[0];
+            var p2ID = room.WaitingQueue[1];
+            room.WaitingQueue.RemoveAt(0);
+            room.WaitingQueue.RemoveAt(0);
+            
+            var p1 = BasePlayer.FindByID(p1ID);
+            var p2 = BasePlayer.FindByID(p2ID);
+            
+            // Both were already cleaned above; if somehow still null, retry with next pair
+            if (p1 == null || !p1.IsConnected || p2 == null || !p2.IsConnected)
+            {
+                if (p1 != null && p1.IsConnected) room.WaitingQueue.Insert(0, p1ID);
+                if (p2 != null && p2.IsConnected) room.WaitingQueue.Insert(0, p2ID);
+                TryRoomMatchmaking(roomID, depth + 1);
+                return;
+            }
+            
+            // Start the duel using the room's chosen mode
+            StartDuel(p1, p2, room.Mode, roomID);
+        }
+        
+        private void SetRoomMode(BasePlayer player, string roomID, string modeName)
+        {
+            if (!privateRooms.ContainsKey(roomID)) return;
+            var room = privateRooms[roomID];
+            
+            if (room.OwnerID != player.userID)
+            {
+                SendReply(player, "Only the room owner can change the weapon mode!");
+                return;
+            }
+            
+            DuelMode mode;
+            switch (modeName.ToUpper())
+            {
+                case "AK47":    mode = DuelMode.AK47;     break;
+                case "SAR":     mode = DuelMode.SAR;      break;
+                case "BOW":     mode = DuelMode.Bow;      break;
+                case "REVOLVER":mode = DuelMode.Revolver; break;
+                case "SPEARGUN":
+                    if (!config.EnableSpeargun)
+                    {
+                        SendReply(player, "Speargun mode is disabled on this server!");
+                        return;
+                    }
+                    mode = DuelMode.Speargun;
+                    break;
+                default:
+                    SendReply(player, "Invalid mode! Choose: AK47, SAR, Bow, Revolver" +
+                              (config.EnableSpeargun ? ", Speargun" : ""));
+                    return;
+            }
+            
+            room.Mode = mode;
+            SendReply(player, $"Room weapon mode set to {mode}!");
+            
+            // Refresh gun select UI to show updated selection
+            ShowGunSelectUI(player, roomID);
             UpdateRoomsList();
         }
         
         private void LeaveRoom(BasePlayer player, string roomID, bool updateUI = true)
         {
             if (player == null || string.IsNullOrWhiteSpace(roomID)) return;
-            
             if (!privateRooms.ContainsKey(roomID)) return;
             
             var room = privateRooms[roomID];
-            
             if (!room.PlayerIDs.Contains(player.userID)) return;
             
-            // Remove player from room
             room.PlayerIDs.Remove(player.userID);
+            room.WaitingQueue.Remove(player.userID);
             
-            SendReply(player, $"Left room '{room.RoomName}'");
+            // Cancel any pending requests this player sent to THIS room
+            if (room.PendingRequests.ContainsKey(player.userID))
+                room.PendingRequests.Remove(player.userID);
             
-            // Notify remaining players
-            foreach (var playerID in room.PlayerIDs)
+            SendReply(player, $"Left {room.RoomName}'s room.");
+            
+            // Close gun select UI if open
+            CuiHelper.DestroyUi(player, "RoomGunSelect");
+            DestroyJoinRequestUI(player);
+            
+            // Notify remaining members
+            foreach (var pid in room.PlayerIDs)
             {
-                var p = BasePlayer.FindByID(playerID);
-                if (p != null)
-                {
-                    SendReply(p, $"{player.displayName} left the room");
-                }
+                var p = BasePlayer.FindByID(pid);
+                if (p != null && p.IsConnected)
+                    SendReply(p, $"{player.displayName} left the room.");
             }
             
-            // Handle owner leaving
-            if (player.userID == room.OwnerID && room.PlayerIDs.Count > 0)
+            if (player.userID == room.OwnerID)
             {
-                // Transfer ownership to next player
-                room.OwnerID = room.PlayerIDs[0];
-                var newOwner = BasePlayer.FindByID(room.OwnerID);
-                if (newOwner != null)
+                if (room.PlayerIDs.Count > 0)
                 {
-                    room.OwnerName = newOwner.displayName;
-                    SendReply(newOwner, "You are now the room owner");
+                    // Transfer ownership
+                    room.OwnerID = room.PlayerIDs[0];
+                    var newOwner = BasePlayer.FindByID(room.OwnerID);
+                    if (newOwner != null)
+                    {
+                        room.OwnerName = newOwner.displayName;
+                        SendReply(newOwner, "You are now the room owner.");
+                        // Show any pending requests to new owner
+                        if (room.PendingRequests.Count > 0)
+                            ShowJoinRequestUI(newOwner, roomID);
+                    }
+                }
+                else
+                {
+                    // No one left — decline all pending requests and close the room
+                    foreach (var kvp in room.PendingRequests)
+                    {
+                        var requester = BasePlayer.FindByID(kvp.Key);
+                        if (requester != null && requester.IsConnected)
+                            SendReply(requester, $"{room.RoomName}'s room has been closed.");
+                    }
+                    privateRooms.Remove(roomID);
                 }
             }
-            
-            // Close room if empty
-            if (room.PlayerIDs.Count == 0)
+            else if (room.PlayerIDs.Count == 0)
             {
                 privateRooms.Remove(roomID);
             }
             
-            if (updateUI)
-            {
-                UpdateRoomsList();
-            }
-        }
-        
-        private void StartRoomMatch(BasePlayer owner, string roomID)
-        {
-            if (owner == null || string.IsNullOrWhiteSpace(roomID)) return;
-            
-            if (!privateRooms.ContainsKey(roomID))
-            {
-                SendReply(owner, "Room does not exist!");
-                return;
-            }
-            
-            var room = privateRooms[roomID];
-            
-            // Check if player is the owner
-            if (owner.userID != room.OwnerID)
-            {
-                SendReply(owner, "Only the room owner can start the match!");
-                return;
-            }
-            
-            // Check if room has exactly 2 players
-            if (room.PlayerIDs.Count != 2)
-            {
-                SendReply(owner, $"Need exactly 2 players to start! ({room.PlayerIDs.Count}/2)");
-                return;
-            }
-            
-            // Get both players
-            var player1 = BasePlayer.FindByID(room.PlayerIDs[0]);
-            var player2 = BasePlayer.FindByID(room.PlayerIDs[1]);
-            
-            if (player1 == null || player2 == null)
-            {
-                SendReply(owner, "One or more players are not available!");
-                return;
-            }
-            
-            // Select random mode
-            var modes = new[] { DuelMode.AK47, DuelMode.SAR, DuelMode.Bow, DuelMode.Revolver };
-            var mode = modes[UnityEngine.Random.Range(0, modes.Length)];
-            
-            // Start the match
-            StartDuel(player1, player2, mode);
-            
-            // Close the room
-            privateRooms.Remove(roomID);
-            
-            // Update UI
-            UpdateRoomsList();
+            if (updateUI) UpdateRoomsList();
         }
         
         private string GetPlayerRoom(ulong playerID)
@@ -2534,9 +2993,17 @@ namespace Oxide.Plugins
             foreach (var room in privateRooms.Values)
             {
                 if (room.PlayerIDs.Contains(playerID))
-                {
                     return room.RoomID;
-                }
+            }
+            return null;
+        }
+        
+        private string GetOwnedRoom(ulong playerID)
+        {
+            foreach (var room in privateRooms.Values)
+            {
+                if (room.OwnerID == playerID)
+                    return room.RoomID;
             }
             return null;
         }
@@ -2545,42 +3012,60 @@ namespace Oxide.Plugins
         {
             var roomsToRemove = new List<string>();
             
+            // Cancel any pending requests this player sent to any room
             foreach (var room in privateRooms.Values)
             {
-                if (room.PlayerIDs.Contains(playerID))
+                if (room.PendingRequests.ContainsKey(playerID))
                 {
-                    room.PlayerIDs.Remove(playerID);
-                    
-                    // Handle owner leaving
-                    if (playerID == room.OwnerID && room.PlayerIDs.Count > 0)
+                    room.PendingRequests.Remove(playerID);
+                    // Refresh owner's request UI
+                    var owner = BasePlayer.FindByID(room.OwnerID);
+                    if (owner != null && owner.IsConnected)
                     {
-                        room.OwnerID = room.PlayerIDs[0];
-                        var newOwner = BasePlayer.FindByID(room.OwnerID);
-                        if (newOwner != null)
-                        {
-                            room.OwnerName = newOwner.displayName;
-                            SendReply(newOwner, "You are now the room owner");
-                        }
-                    }
-                    
-                    // Mark for removal if empty
-                    if (room.PlayerIDs.Count == 0)
-                    {
-                        roomsToRemove.Add(room.RoomID);
+                        DestroyJoinRequestUI(owner);
+                        ShowJoinRequestUI(owner, room.RoomID);
                     }
                 }
             }
             
-            // Remove empty rooms
-            foreach (var roomID in roomsToRemove)
+            foreach (var room in privateRooms.Values)
             {
-                privateRooms.Remove(roomID);
+                if (!room.PlayerIDs.Contains(playerID)) continue;
+                
+                room.PlayerIDs.Remove(playerID);
+                room.WaitingQueue.Remove(playerID);
+                
+                if (playerID == room.OwnerID && room.PlayerIDs.Count > 0)
+                {
+                    room.OwnerID = room.PlayerIDs[0];
+                    var newOwner = BasePlayer.FindByID(room.OwnerID);
+                    if (newOwner != null)
+                    {
+                        room.OwnerName = newOwner.displayName;
+                        SendReply(newOwner, "You are now the room owner.");
+                        if (room.PendingRequests.Count > 0)
+                            ShowJoinRequestUI(newOwner, room.RoomID);
+                    }
+                }
+                
+                if (room.PlayerIDs.Count == 0)
+                {
+                    // Decline pending requests before closing
+                    foreach (var kvp in room.PendingRequests)
+                    {
+                        var requester = BasePlayer.FindByID(kvp.Key);
+                        if (requester != null && requester.IsConnected)
+                            SendReply(requester, $"The room you requested to join has been closed.");
+                    }
+                    roomsToRemove.Add(room.RoomID);
+                }
             }
             
+            foreach (var rid in roomsToRemove)
+                privateRooms.Remove(rid);
+            
             if (roomsToRemove.Count > 0)
-            {
                 UpdateRoomsList();
-            }
         }
         
         private void UpdateRoomsList()
@@ -2588,9 +3073,7 @@ namespace Oxide.Plugins
             foreach (var player in BasePlayer.activePlayerList)
             {
                 if (player != null && player.IsConnected)
-                {
                     ShowLobbyBrowser(player);
-                }
             }
         }
         
@@ -3067,6 +3550,8 @@ namespace Oxide.Plugins
                 DestroyJoinButton(player);
                 DestroyLeaveButton(player);
                 DestroyWinLoseUI(player);
+                DestroyJoinRequestUI(player);
+                CuiHelper.DestroyUi(player, "RoomGunSelect");
             }
 
             // Save all data on plugin unload
@@ -3488,6 +3973,7 @@ namespace Oxide.Plugins
             public int Player1Score = 0;
             public int Player2Score = 0;
             public bool RoundInProgress = false;
+            public string RoomID = null; // Non-null if this match was started from a private room
             
             public ActiveMatch(ulong p1, ulong p2, DuelMode mode, Arena arena, int instanceId, int bestOf)
             {
@@ -3613,9 +4099,10 @@ namespace Oxide.Plugins
             public string RoomName;
             public ulong OwnerID;
             public string OwnerName;
-            public List<ulong> PlayerIDs = new List<ulong>();
-            public int MaxPlayers = 2;
-            public DuelMode Mode;
+            public List<ulong> PlayerIDs = new List<ulong>();         // All players currently in the room
+            public List<ulong> WaitingQueue = new List<ulong>();      // Players waiting for a 1v1 match
+            public Dictionary<ulong, string> PendingRequests = new Dictionary<ulong, string>(); // requesterID -> displayName
+            public DuelMode Mode = DuelMode.AK47;
             public DateTime Created;
             public bool IsOpen = true;
             
@@ -3625,15 +4112,8 @@ namespace Oxide.Plugins
                 Created = DateTime.Now;
             }
             
-            public bool IsFull()
-            {
-                return PlayerIDs.Count >= MaxPlayers;
-            }
-            
-            public bool HasPlayer(ulong playerID)
-            {
-                return PlayerIDs.Contains(playerID);
-            }
+            public bool HasPlayer(ulong playerID) => PlayerIDs.Contains(playerID);
+            public bool HasPendingRequest(ulong playerID) => PendingRequests.ContainsKey(playerID);
         }
         
         #endregion
