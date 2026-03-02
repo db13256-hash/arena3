@@ -175,6 +175,9 @@ namespace Oxide.Plugins
             
             [JsonProperty("Amount")]
             public int Amount;
+            
+            [JsonProperty("SkinID")]
+            public ulong SkinID = 0;
         }
         
         // Arena configuration - defines duel arena spawn points
@@ -229,7 +232,7 @@ namespace Oxide.Plugins
         
         private void Init()
         {
-            queueManager = new QueueManager();
+            queueManager = new QueueManager(config.EnableSpeargun);
             arenaManager = new ArenaManager(arenas, config.MaxInstancesPerArena);
             loadoutManager = new LoadoutManager(config);
             aimTrainManager = new AimTrainManager();
@@ -251,7 +254,7 @@ namespace Oxide.Plugins
             // Load persistent player data
             LoadData();
             
-            Puts($"Hellis Plugin v1.0.0 loaded - {config.ServerName}");
+            Puts($"Hellis Plugin v1.1.0 loaded - {config.ServerName}");
             Puts($"Multi-instance arenas enabled: {config.MaxInstancesPerArena} instances per arena");
             
             // Auto-save player data every 5 minutes
@@ -541,13 +544,28 @@ namespace Oxide.Plugins
         [ChatCommand("leave")]
         private void LeaveCommand(BasePlayer player, string command, string[] args)
         {
-            if (queueManager.LeaveQueue(player.userID))
+            // Handle active match (forfeit)
+            if (activeMatches.ContainsKey(player.userID))
+            {
+                var match = activeMatches[player.userID];
+                EndMatch(match, false, player.userID);
+                SendReply(player, "You forfeited the match.");
+                return;
+            }
+
+            // Try to leave old queue system
+            bool leftOldQueue = queueManager.LeaveQueue(player.userID);
+
+            // Try to leave Phase 3 queue system
+            bool inNewQueue = GetPlayerQueueType(player.userID).HasValue;
+            LeaveQueueInternal(player, false);
+
+            if (leftOldQueue || inNewQueue)
             {
                 SendReply(player, "Left the queue.");
                 DestroyLeaveButton(player);
                 TeleportToLobby(player);
-                // ShowJoinButton(player); // Removed - lobby browser handles this
-                ShowLobbyBrowser(player); // Show lobby browser instead
+                ShowLobbyBrowser(player);
             }
             else
             {
@@ -771,7 +789,7 @@ namespace Oxide.Plugins
             if (player == null) return;
             
             // Admin check
-            if (!player.IsAdmin)
+            if (!permission.UserHasPermission(player.UserIDString, "hellisplugin.admin"))
             {
                 SendReply(player, "You must be an admin to use this command.");
                 return;
@@ -1772,13 +1790,37 @@ namespace Oxide.Plugins
             int publicCount = queuesByType.ContainsKey(QueueType.Public) ? queuesByType[QueueType.Public].Count : 0;
             AddQueueEntry(elements, "LobbyBrowser", "Public", $"({publicCount} Players)", queueY, "joinqueue.public");
             
-            // Public AK queue - increased spacing to prevent overlap
-            queueY -= 0.10f; // Increased from 0.08f to 0.10f for better spacing
+            // Public AK queue
+            queueY -= 0.08f;
             int akCount = queuesByType.ContainsKey(QueueType.PublicAK) ? queuesByType[QueueType.PublicAK].Count : 0;
             AddQueueEntry(elements, "LobbyBrowser", "Public AK", $"({akCount} Players)", queueY, "joinqueue.ak");
             
+            // Public SAR queue
+            queueY -= 0.08f;
+            int sarCount = queuesByType.ContainsKey(QueueType.PublicSAR) ? queuesByType[QueueType.PublicSAR].Count : 0;
+            AddQueueEntry(elements, "LobbyBrowser", "Public SAR", $"({sarCount} Players)", queueY, "joinqueue.sar");
+            
+            // Public Bow queue
+            queueY -= 0.08f;
+            int bowCount = queuesByType.ContainsKey(QueueType.PublicBow) ? queuesByType[QueueType.PublicBow].Count : 0;
+            AddQueueEntry(elements, "LobbyBrowser", "Public Bow", $"({bowCount} Players)", queueY, "joinqueue.bow");
+            
+            // Public Revolver queue
+            queueY -= 0.08f;
+            int revCount = queuesByType.ContainsKey(QueueType.PublicRevolver) ? queuesByType[QueueType.PublicRevolver].Count : 0;
+            AddQueueEntry(elements, "LobbyBrowser", "Public Revolver", $"({revCount} Players)", queueY, "joinqueue.rev");
+            
+            // Public Speargun queue (shown only when enabled)
+            if (config.EnableSpeargun)
+            {
+                queueY -= 0.08f;
+                int spearCount = queuesByType.ContainsKey(QueueType.PublicSpeargun) ? queuesByType[QueueType.PublicSpeargun].Count : 0;
+                AddQueueEntry(elements, "LobbyBrowser", "Speargun", $"({spearCount} Players)", queueY, "joinqueue.spear");
+            }
+            
             // ========== PRIVATE ROOMS SECTION ==========
-            float privateStartY = 0.42f;
+            // Calculate available space: clamp so private section doesn't collide with queue entries
+            float privateStartY = Math.Max(queueY - 0.06f, 0.20f);
             
             // "PRIVATE ROOMS" header
             elements.Add(new CuiLabel
@@ -1794,10 +1836,10 @@ namespace Oxide.Plugins
                 RectTransform = { AnchorMin = $"0.05 {privateStartY - 0.005f}", AnchorMax = $"0.95 {privateStartY}" }
             }, "LobbyBrowser");
             
-            // Private room listings (placeholder for Phase 4)
+            // Private room listings — cap at 2 entries to keep CREATE ROOM button visible
             float roomY = privateStartY - 0.08f;
             int roomCount = 0;
-            foreach (var room in privateRooms.Values.Take(5)) // Show up to 5 rooms
+            foreach (var room in privateRooms.Values.Take(2))
             {
                 AddRoomEntry(elements, "LobbyBrowser", room, roomY);
                 roomY -= 0.07f;
@@ -1836,18 +1878,18 @@ namespace Oxide.Plugins
                 RectTransform = { AnchorMin = $"0.05 {yPos}", AnchorMax = $"0.95 {yPos + 0.07f}" }
             }, parent, entryName);
             
-            // Queue name
+            // Queue name (top half of the entry)
             elements.Add(new CuiLabel
             {
                 Text = { Text = queueName, FontSize = 13, Align = TextAnchor.MiddleLeft, Color = "1 1 1 1" },
-                RectTransform = { AnchorMin = "0.05 0", AnchorMax = "0.60 1" }
+                RectTransform = { AnchorMin = "0.05 0.50", AnchorMax = "0.65 1" }
             }, entryName);
             
-            // Player count
+            // Player count (bottom half of the entry)
             elements.Add(new CuiLabel
             {
-                Text = { Text = playerCount, FontSize = 11, Align = TextAnchor.MiddleLeft, Color = "0.7 0.7 0.7 1" },
-                RectTransform = { AnchorMin = "0.05 0", AnchorMax = "0.60 1" }
+                Text = { Text = playerCount, FontSize = 10, Align = TextAnchor.MiddleLeft, Color = "0.7 0.7 0.7 1" },
+                RectTransform = { AnchorMin = "0.05 0", AnchorMax = "0.65 0.50" }
             }, entryName);
             
             // JOIN button
@@ -2033,6 +2075,48 @@ namespace Oxide.Plugins
             JoinQueueByType(player, QueueType.PublicAK);
         }
         
+        [ConsoleCommand("joinqueue.sar")]
+        private void JoinQueueSARCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+            
+            JoinQueueByType(player, QueueType.PublicSAR);
+        }
+        
+        [ConsoleCommand("joinqueue.bow")]
+        private void JoinQueueBowCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+            
+            JoinQueueByType(player, QueueType.PublicBow);
+        }
+        
+        [ConsoleCommand("joinqueue.rev")]
+        private void JoinQueueRevCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+            
+            JoinQueueByType(player, QueueType.PublicRevolver);
+        }
+        
+        [ConsoleCommand("joinqueue.spear")]
+        private void JoinQueueSpearCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+            
+            if (!config.EnableSpeargun)
+            {
+                SendReply(player, "Speargun mode is currently disabled.");
+                return;
+            }
+            
+            JoinQueueByType(player, QueueType.PublicSpeargun);
+        }
+        
         [ConsoleCommand("lobby.createroom")]
         private void CreateRoomCommand(ConsoleSystem.Arg arg)
         {
@@ -2138,7 +2222,9 @@ namespace Oxide.Plugins
             string queueName = queueType == QueueType.Public ? "Public" :
                               queueType == QueueType.PublicAK ? "AK" :
                               queueType == QueueType.PublicSAR ? "SAR" :
-                              queueType == QueueType.PublicBow ? "Bow" : "Revolver";
+                              queueType == QueueType.PublicBow ? "Bow" :
+                              queueType == QueueType.PublicRevolver ? "Revolver" :
+                              queueType == QueueType.PublicSpeargun ? "Speargun" : "Unknown";
             
             SendReply(player, $"Joined {queueName} queue! Waiting for opponent...");
             ShowLobbyBrowser(player);
@@ -2235,11 +2321,15 @@ namespace Oxide.Plugins
                 case QueueType.PublicRevolver:
                     mode = DuelMode.Revolver;
                     break;
+                case QueueType.PublicSpeargun:
+                    mode = DuelMode.Speargun;
+                    break;
                 case QueueType.Public:
                 default:
-                    // Random mode for public queue
-                    var modes = new[] { DuelMode.AK47, DuelMode.SAR, DuelMode.Bow, DuelMode.Revolver };
-                    mode = modes[UnityEngine.Random.Range(0, modes.Length)];
+                    // Random mode for public queue — include Speargun when enabled
+                    var modeList = new List<DuelMode> { DuelMode.AK47, DuelMode.SAR, DuelMode.Bow, DuelMode.Revolver };
+                    if (config.EnableSpeargun) modeList.Add(DuelMode.Speargun);
+                    mode = modeList[UnityEngine.Random.Range(0, modeList.Count)];
                     break;
             }
             
@@ -2724,8 +2814,8 @@ namespace Oxide.Plugins
             
             CuiHelper.AddUi(player, elements);
             
-            // Auto-destroy after 5 seconds
-            timer.Once(1f, () => DestroyWinLoseUI(player));
+            // Auto-dismiss after 5 seconds
+            timer.Once(5f, () => DestroyWinLoseUI(player));
         }
         
         private void DestroyWinLoseUI(BasePlayer player)
@@ -3033,9 +3123,11 @@ namespace Oxide.Plugins
         {
             private Dictionary<DuelMode, List<QueueEntry>> queues = new Dictionary<DuelMode, List<QueueEntry>>();
             private Dictionary<ulong, DuelMode> playerQueues = new Dictionary<ulong, DuelMode>();
+            private bool enableSpeargun;
             
-            public QueueManager()
+            public QueueManager(bool enableSpeargun = false)
             {
+                this.enableSpeargun = enableSpeargun;
                 queues[DuelMode.AK47] = new List<QueueEntry>();
                 queues[DuelMode.SAR] = new List<QueueEntry>();
                 queues[DuelMode.Speargun] = new List<QueueEntry>();
@@ -3135,7 +3227,7 @@ namespace Oxide.Plugins
             
             private DuelMode GetRandomGameMode()
             {
-                // Select random mode for Any queue matches
+                // Select random mode for Any queue matches — include Speargun when enabled
                 var availableModes = new List<DuelMode>
                 {
                     DuelMode.AK47,
@@ -3144,8 +3236,7 @@ namespace Oxide.Plugins
                     DuelMode.Revolver
                 };
                 
-                // Note: Speargun handling would need access to config
-                // For now, only use the 4 standard modes
+                if (enableSpeargun) availableModes.Add(DuelMode.Speargun);
                 
                 return availableModes[UnityEngine.Random.Range(0, availableModes.Count)];
             }
@@ -3380,7 +3471,8 @@ namespace Oxide.Plugins
                             Items = kvp.Value.Items.Select(item => new LoadoutItem
                             {
                                 ShortName = item.ShortName,
-                                Amount = item.Amount
+                                Amount = item.Amount,
+                                SkinID = item.SkinID
                             }).ToList()
                         };
                         
@@ -3531,11 +3623,12 @@ namespace Oxide.Plugins
         // Queue types for lobby browser
         public enum QueueType
         {
-            Public,         // Any mode, random
-            PublicAK,       // AK47 only
-            PublicSAR,      // SAR only
-            PublicBow,      // Bow only
-            PublicRevolver  // Revolver only
+            Public,           // Any mode, random
+            PublicAK,         // AK47 only
+            PublicSAR,        // SAR only
+            PublicBow,        // Bow only
+            PublicRevolver,   // Revolver only
+            PublicSpeargun    // Speargun only
         }
         
         // Private room data structure
