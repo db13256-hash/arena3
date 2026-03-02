@@ -704,6 +704,13 @@ namespace Oxide.Plugins
                 
                 ShowLobbyBrowser(player); // Show lobby browser instead of old button
                 ShowLeaderboardUI(player);
+                
+                // Restore leave button for players waiting in a Phase 3 queue
+                if (GetPlayerQueueType(player.userID).HasValue || queueManager.IsQueued(player.userID))
+                {
+                    ShowLeaveButton(player);
+                }
+                
                 refreshed++;
             }
             if (refreshed > 0)
@@ -1753,26 +1760,19 @@ namespace Oxide.Plugins
             
             var elements = new CuiElementContainer();
             
-            // Main button panel - bottom right area (slightly left to avoid health UI), orange/red for leave action
+            // Positioned between the hotbar (bottom) and player vitals — centered on screen
             elements.Add(new CuiPanel
             {
                 Image = { Color = "0.8 0.3 0.2 0.9" }, // Orange/Red
-                RectTransform = { AnchorMin = "0.70 0.02", AnchorMax = "0.83 0.10" },
+                RectTransform = { AnchorMin = "0.38 0.068", AnchorMax = "0.62 0.110" },
                 CursorEnabled = false  // Don't capture cursor
             }, "Hud", "LeaveButton");
             
             // Title
             elements.Add(new CuiLabel
             {
-                Text = { Text = "LEAVE", FontSize = 16, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" },
-                RectTransform = { AnchorMin = "0 0.5", AnchorMax = "1 1" }
-            }, "LeaveButton");
-            
-            // Subtitle
-            elements.Add(new CuiLabel
-            {
-                Text = { Text = "Match/Queue", FontSize = 10, Align = TextAnchor.MiddleCenter, Color = "0.9 0.9 0.9 1" },
-                RectTransform = { AnchorMin = "0 0", AnchorMax = "1 0.5" }
+                Text = { Text = "LEAVE QUEUE / MATCH", FontSize = 14, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" },
+                RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" }
             }, "LeaveButton");
             
             // Clickable button
@@ -2220,6 +2220,14 @@ namespace Oxide.Plugins
                 return;
             }
             
+            // Check if player is in Phase 3 public queue
+            if (GetPlayerQueueType(player.userID).HasValue)
+            {
+                LeaveQueueInternal(player, true); // handles DestroyLeaveButton internally
+                TeleportToLobby(player);
+                return;
+            }
+            
             // Check if player is in active match
             if (activeMatches.ContainsKey(player.userID))
             {
@@ -2522,6 +2530,7 @@ namespace Oxide.Plugins
             
             SendReply(player, $"Joined {queueName} queue! Waiting for opponent...");
             ShowLobbyBrowser(player);
+            ShowLeaveButton(player); // Show leave button while waiting in queue
         }
         
         private void LeaveQueueInternal(BasePlayer player, bool updateUI = true)
@@ -2537,10 +2546,16 @@ namespace Oxide.Plugins
                 }
             }
             
-            if (wasInQueue && updateUI)
+            if (wasInQueue)
             {
-                SendReply(player, "Left the queue.");
-                ShowLobbyBrowser(player);
+                // Always destroy leave button when leaving a queue (regardless of updateUI)
+                DestroyLeaveButton(player);
+                
+                if (updateUI)
+                {
+                    SendReply(player, "Left the queue.");
+                    ShowLobbyBrowser(player);
+                }
             }
         }
         
