@@ -1796,20 +1796,10 @@ namespace Oxide.Plugins
             int akCount = queuesByType.ContainsKey(QueueType.PublicAK) ? queuesByType[QueueType.PublicAK].Count : 0;
             AddQueueEntry(elements, "LobbyBrowser", "Public AK", $"({akCount} Players)", queueY, "joinqueue.ak");
             
-            // Public SAR queue
-            queueY -= 0.08f;
-            int sarCount = queuesByType.ContainsKey(QueueType.PublicSAR) ? queuesByType[QueueType.PublicSAR].Count : 0;
-            AddQueueEntry(elements, "LobbyBrowser", "Public SAR", $"({sarCount} Players)", queueY, "joinqueue.sar");
-            
             // Public Bow queue
             queueY -= 0.08f;
             int bowCount = queuesByType.ContainsKey(QueueType.PublicBow) ? queuesByType[QueueType.PublicBow].Count : 0;
             AddQueueEntry(elements, "LobbyBrowser", "Public Bow", $"({bowCount} Players)", queueY, "joinqueue.bow");
-            
-            // Public Revolver queue
-            queueY -= 0.08f;
-            int revCount = queuesByType.ContainsKey(QueueType.PublicRevolver) ? queuesByType[QueueType.PublicRevolver].Count : 0;
-            AddQueueEntry(elements, "LobbyBrowser", "Public Revolver", $"({revCount} Players)", queueY, "joinqueue.rev");
             
             // Public Speargun queue (shown only when enabled)
             if (config.EnableSpeargun)
@@ -2076,15 +2066,6 @@ namespace Oxide.Plugins
             JoinQueueByType(player, QueueType.PublicAK);
         }
         
-        [ConsoleCommand("joinqueue.sar")]
-        private void JoinQueueSARCommand(ConsoleSystem.Arg arg)
-        {
-            var player = arg.Player();
-            if (player == null) return;
-            
-            JoinQueueByType(player, QueueType.PublicSAR);
-        }
-        
         [ConsoleCommand("joinqueue.bow")]
         private void JoinQueueBowCommand(ConsoleSystem.Arg arg)
         {
@@ -2092,15 +2073,6 @@ namespace Oxide.Plugins
             if (player == null) return;
             
             JoinQueueByType(player, QueueType.PublicBow);
-        }
-        
-        [ConsoleCommand("joinqueue.rev")]
-        private void JoinQueueRevCommand(ConsoleSystem.Arg arg)
-        {
-            var player = arg.Player();
-            if (player == null) return;
-            
-            JoinQueueByType(player, QueueType.PublicRevolver);
         }
         
         [ConsoleCommand("joinqueue.spear")]
@@ -2222,9 +2194,7 @@ namespace Oxide.Plugins
             
             string queueName = queueType == QueueType.Public ? "Public" :
                               queueType == QueueType.PublicAK ? "AK" :
-                              queueType == QueueType.PublicSAR ? "SAR" :
                               queueType == QueueType.PublicBow ? "Bow" :
-                              queueType == QueueType.PublicRevolver ? "Revolver" :
                               queueType == QueueType.PublicSpeargun ? "Speargun" : "Unknown";
             
             SendReply(player, $"Joined {queueName} queue! Waiting for opponent...");
@@ -2313,14 +2283,8 @@ namespace Oxide.Plugins
                 case QueueType.PublicAK:
                     mode = DuelMode.AK47;
                     break;
-                case QueueType.PublicSAR:
-                    mode = DuelMode.SAR;
-                    break;
                 case QueueType.PublicBow:
                     mode = DuelMode.Bow;
-                    break;
-                case QueueType.PublicRevolver:
-                    mode = DuelMode.Revolver;
                     break;
                 case QueueType.PublicSpeargun:
                     mode = DuelMode.Speargun;
@@ -3636,11 +3600,9 @@ namespace Oxide.Plugins
         // Queue types for lobby browser
         public enum QueueType
         {
-            Public,           // Any mode, random
+            Public,           // Any mode, random (AK47, SAR, Bow, Revolver)
             PublicAK,         // AK47 only
-            PublicSAR,        // SAR only
             PublicBow,        // Bow only
-            PublicRevolver,   // Revolver only
             PublicSpeargun    // Speargun only
         }
         
