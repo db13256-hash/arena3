@@ -1745,12 +1745,13 @@ namespace Oxide.Plugins
             var elements = new CuiElementContainer();
             
             // Main panel - right side, dark gray background
+            // CursorEnabled = false so the panel doesn't capture the cursor and lock camera rotation
             elements.Add(new CuiPanel
             {
                 Image = { Color = "0.17 0.17 0.17 0.95" }, // Dark gray #2B2B2B
                 RectTransform = { AnchorMin = "0.70 0.15", AnchorMax = "0.98 0.85" },
-                CursorEnabled = true
-            }, "Overlay", "LobbyBrowser");
+                CursorEnabled = false
+            }, "Hud", "LobbyBrowser");
             
             // Header: "TEAM MATCHES" - Cyan
             elements.Add(new CuiLabel
@@ -3092,6 +3093,18 @@ namespace Oxide.Plugins
         
         private void Unload()
         {
+            // Destroy all UI elements for every connected player before the plugin is unloaded.
+            // Without this, Oxide leaves stale CUI panels on screen permanently.
+            foreach (var player in BasePlayer.activePlayerList)
+            {
+                if (player == null || !player.IsConnected) continue;
+                DestroyLobbyBrowser(player);
+                DestroyLeaderboardUI(player);
+                DestroyJoinButton(player);
+                DestroyLeaveButton(player);
+                DestroyWinLoseUI(player);
+            }
+
             // Save all data on plugin unload
             SavePlayerData();
             SaveArenas();
