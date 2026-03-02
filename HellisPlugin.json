@@ -1,0 +1,74 @@
+{
+  "Server Name": "Hellis Server",
+  "Enable Aim Training": true,
+  "Enable 1v1 Duels": true,
+  "Enable Speargun Mode": true,
+  "Countdown Duration (seconds)": 3,
+  "Best of X Rounds": 3,
+  "Auto Requeue After Match": true,
+  "Max Instances Per Arena": 5,
+  "Lobby Position": {
+    "x": 0.0,
+    "y": 0.0,
+    "z": 0.0
+  },
+  "Lobby Position Set": false,
+  "Lobby Radius": 50.0,
+  "Aim Train Arena Position": {
+    "x": -100.0,
+    "y": 0.0,
+    "z": -100.0
+  },
+  "Aim Train Arena Radius": 30.0,
+  "Enable Zone Enforcement": false,
+  "Loadouts": {
+    "AK47": {
+      "Items": [
+        { "ShortName": "rifle.ak", "Amount": 1 },
+        { "ShortName": "ammo.rifle", "Amount": 120 },
+        { "ShortName": "metal.plate.torso", "Amount": 1 },
+        { "ShortName": "metal.facemask", "Amount": 1 },
+        { "ShortName": "roadsign.kilt", "Amount": 1 },
+        { "ShortName": "syringe.medical", "Amount": 4 }
+      ]
+    },
+    "SAR": {
+      "Items": [
+        { "ShortName": "rifle.semiauto", "Amount": 1 },
+        { "ShortName": "ammo.rifle", "Amount": 96 },
+        { "ShortName": "metal.plate.torso", "Amount": 1 },
+        { "ShortName": "coffeecan.helmet", "Amount": 1 },
+        { "ShortName": "roadsign.kilt", "Amount": 1 },
+        { "ShortName": "syringe.medical", "Amount": 4 }
+      ]
+    },
+    "Speargun": {
+      "Items": [
+        { "ShortName": "speargun", "Amount": 1 },
+        { "ShortName": "speargun.spear", "Amount": 16 },
+        { "ShortName": "diving.fins", "Amount": 1 },
+        { "ShortName": "diving.mask", "Amount": 1 },
+        { "ShortName": "diving.tank", "Amount": 1 },
+        { "ShortName": "diving.wetsuit", "Amount": 1 },
+        { "ShortName": "syringe.medical", "Amount": 3 }
+      ]
+    },
+    "Bow": {
+      "Items": [
+        { "ShortName": "bow.hunting", "Amount": 1 },
+        { "ShortName": "arrow.wooden", "Amount": 60 },
+        { "ShortName": "attire.hide.vest", "Amount": 1 },
+        { "ShortName": "bandage", "Amount": 6 }
+      ]
+    },
+    "Revolver": {
+      "Items": [
+        { "ShortName": "pistol.revolver", "Amount": 1 },
+        { "ShortName": "ammo.pistol", "Amount": 64 },
+        { "ShortName": "burlap.shirt", "Amount": 1 },
+        { "ShortName": "burlap.trousers", "Amount": 1 },
+        { "ShortName": "bandage", "Amount": 4 }
+      ]
+    }
+  }
+}
