@@ -2166,6 +2166,7 @@ namespace Oxide.Plugins
                 ("SAR", DuelMode.SAR),
                 ("Bow", DuelMode.Bow),
                 ("Revolver", DuelMode.Revolver),
+                ("Random", DuelMode.Any),
             };
             if (config.EnableSpeargun)
                 modeList.Add(("Speargun", DuelMode.Speargun));
@@ -2304,6 +2305,13 @@ namespace Oxide.Plugins
         {
             var player = arg.Player();
             if (player == null) return;
+            
+            // Block if player is inside a private room
+            if (GetPlayerRoom(player.userID) != null)
+            {
+                SendReply(player, "You must leave your private room before joining a public queue!");
+                return;
+            }
             
             // Check if already in queue
             if (queueManager.IsQueued(player.userID))
@@ -2494,6 +2502,13 @@ namespace Oxide.Plugins
         private void JoinQueueByType(BasePlayer player, QueueType queueType)
         {
             if (player == null) return;
+            
+            // Block if player is inside a private room
+            if (GetPlayerRoom(player.userID) != null)
+            {
+                SendReply(player, "You must leave your private room before joining a public queue!");
+                return;
+            }
             
             // Check if player is already in a match
             if (activeMatches.Values.Any(d => d.Player1ID == player.userID || d.Player2ID == player.userID))
@@ -2894,8 +2909,15 @@ namespace Oxide.Plugins
                 return;
             }
             
-            // Start the duel using the room's chosen mode
-            StartDuel(p1, p2, room.Mode, roomID);
+            // Start the duel using the room's chosen mode; resolve Any to a random concrete mode
+            DuelMode duelMode = room.Mode;
+            if (duelMode == DuelMode.Any)
+            {
+                var randomModes = new List<DuelMode> { DuelMode.AK47, DuelMode.SAR, DuelMode.Bow, DuelMode.Revolver };
+                if (config.EnableSpeargun) randomModes.Add(DuelMode.Speargun);
+                duelMode = randomModes[UnityEngine.Random.Range(0, randomModes.Count)];
+            }
+            StartDuel(p1, p2, duelMode, roomID);
         }
         
         private void SetRoomMode(BasePlayer player, string roomID, string modeName)
@@ -2916,6 +2938,7 @@ namespace Oxide.Plugins
                 case "SAR":     mode = DuelMode.SAR;      break;
                 case "BOW":     mode = DuelMode.Bow;      break;
                 case "REVOLVER":mode = DuelMode.Revolver; break;
+                case "RANDOM":  mode = DuelMode.Any;      break;
                 case "SPEARGUN":
                     if (!config.EnableSpeargun)
                     {
@@ -2925,7 +2948,7 @@ namespace Oxide.Plugins
                     mode = DuelMode.Speargun;
                     break;
                 default:
-                    SendReply(player, "Invalid mode! Choose: AK47, SAR, Bow, Revolver" +
+                    SendReply(player, "Invalid mode! Choose: AK47, SAR, Bow, Revolver, Random" +
                               (config.EnableSpeargun ? ", Speargun" : ""));
                     return;
             }
