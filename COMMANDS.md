@@ -1,7 +1,7 @@
 # Hellis Plugin - Complete Command Reference
 
-**Version:** 2.0  
-**Last Updated:** 2026-02-14
+**Version:** 1.1.0  
+**Last Updated:** 2026-03-03
 
 This document provides a comprehensive list of ALL commands available in the Hellis Plugin for Rust servers.
 
@@ -21,93 +21,81 @@ This document provides a comprehensive list of ALL commands available in the Hel
 
 ### Queue & Match Commands
 
-#### `/duel <mode>`
-Join the 1v1 duel queue for a specific weapon mode.
-
-**Modes:**
-- `ak` - AK47 duels
-- `sar` - Semi-Automatic Rifle duels
-- `spear` - Speargun duels
-- `bow` - Bow duels
-- `rev` - Revolver duels
-
-**Usage:**
-```
-/duel ak
-/duel sar
-/duel spear
-/duel bow
-/duel rev
-```
-
-**Aliases:** None
-
-**Permission Required:** None (available to all players)
-
-**Example:**
-```
-Player: /duel ak
-Server: You've joined the AK47 queue. Waiting for an opponent...
-```
-
----
-
 #### `/leave`
-Leave the current queue or forfeit from a match.
+Leave the current queue, private room, or forfeit from an active match.
 
 **Usage:**
 ```
 /leave
 ```
 
-**Aliases:** None
-
 **Permission Required:** None
 
 **Example:**
 ```
 Player: /leave
-Server: You've left the queue.
+Server: Left the queue.
 ```
 
 ---
 
 #### `/forfeit`
-Forfeit the current match (if you're in one).
+Forfeit the current match (if you are in one).
 
 **Usage:**
 ```
 /forfeit
 ```
 
-**Aliases:** None
-
 **Permission Required:** None
 
 **Example:**
 ```
 Player: /forfeit
-Server: You've forfeited the match. Returning to lobby...
+Server: You forfeited the match.
+```
+
+---
+
+#### `/autorequeue [on|off]`
+Toggle automatic re-queuing after a match ends.
+
+**Usage:**
+```
+/autorequeue
+/autorequeue on
+/autorequeue off
+```
+
+**Permission Required:** None
+
+**Description:**
+- Without arguments: shows current setting
+- `on` / `enable` - automatically re-join the queue after each match
+- `off` / `disable` - return to lobby after each match (manual re-queue)
+
+**Example:**
+```
+Player: /autorequeue on
+Server: ✓ Auto-requeue ENABLED - You'll automatically rejoin queue after matches
 ```
 
 ---
 
 #### `/aimtrain`
-Join the aim training mode.
+Start an aim training session.
 
 **Usage:**
 ```
 /aimtrain
 ```
 
-**Aliases:** None
-
-**Permission Required:** None
+**Permission Required:** `hellisplugin.use`
 
 **Example:**
 ```
 Player: /aimtrain
-Server: Aim training mode activated!
+Server: Aim Training started! Hit the targets to improve your accuracy.
 ```
 
 ---
@@ -122,36 +110,31 @@ View your personal duel statistics.
 /stats
 ```
 
-**Aliases:** None
-
 **Permission Required:** None
 
 **Shows:**
 - Total matches played
 - Wins and losses
 - Win rate percentage
-- Kills and deaths
-- K/D ratio
 - Rounds won and lost
 
 **Example:**
 ```
 Player: /stats
-Server: 
-════════════════════════════════
-Your Duel Statistics
-════════════════════════════════
-Total Matches: 15
-Record: 10W - 5L (66.67%)
-K/D: 25 kills / 12 deaths (2.08)
-Rounds: 22W - 18L
-════════════════════════════════
+Server:
+=== Your Stats ===
+Matches: 15
+Wins: 10
+Losses: 5
+Win Rate: 66.7%
+Rounds Won: 22
+Rounds Lost: 18
 ```
 
 ---
 
 #### `/leaderboard`
-View the global leaderboard showing top 10 players.
+View the global leaderboard showing the top 10 players by win rate.
 
 **Usage:**
 ```
@@ -164,20 +147,17 @@ View the global leaderboard showing top 10 players.
 
 **Shows:**
 - Top 10 players ranked by win rate
-- Player name, W-L record, and K/D ratio
+- Player name, W-L record, and win percentage
 - Your own rank if not in top 10
 
 **Example:**
 ```
 Player: /leaderboard
 Server:
-═══════════════════════════════════════
-Hellis Duels - Global Leaderboard
-═══════════════════════════════════════
-1. PlayerOne (15-2) K/D: 7.50
-2. PlayerTwo (12-3) K/D: 4.00
-3. YOU (10-5) K/D: 2.00
-...
+=== GLOBAL LEADERBOARD - TOP 10 ===
+1. PlayerOne - 15W/2L (88.2%)
+2. PlayerTwo - 12W/3L (80.0%)
+3. YOU - 10W/5L (66.7%)
 ```
 
 ---
@@ -187,60 +167,40 @@ Alias for `/leaderboard`. See above for details.
 
 ---
 
-### UI Commands
-
-#### `/duelui`
-Toggle the duel UI panel on/off.
-
-**Usage:**
-```
-/duelui
-```
-
-**Aliases:** None
-
-**Permission Required:** None
-
-**Description:**
-- Shows/hides the central duel UI panel
-- UI contains quick-join buttons for all modes
-- Toggle with one command
-
-**Example:**
-```
-Player: /duelui
-Server: Duel UI shown. Click buttons to join queue!
-
-Player: /duelui (again)
-Server: Duel UI hidden. Type /duelui to show it.
-```
-
----
-
 #### `/toggleleaderboard`
-Toggle the persistent leaderboard UI in top left corner.
+Show or hide the persistent leaderboard UI in the top-left corner.
 
 **Usage:**
 ```
 /toggleleaderboard
 ```
 
-**Aliases:** None
-
 **Permission Required:** None
-
-**Description:**
-- Shows/hides the persistent global leaderboard
-- Leaderboard displays in top left corner
-- Updates in real-time after matches
 
 **Example:**
 ```
 Player: /toggleleaderboard
-Server: Leaderboard hidden.
+Server: Leaderboard UI hidden. Type /toggleleaderboard to show it again.
+```
 
-Player: /toggleleaderboard (again)
-Server: Leaderboard shown.
+---
+
+### UI Commands
+
+#### `/showui`
+Refresh all UI elements (lobby browser + leaderboard). Use this if buttons disappear.
+
+**Usage:**
+```
+/showui
+```
+
+**Permission Required:** None
+
+**Example:**
+```
+Player: /showui
+Server: UI elements refreshed!
 ```
 
 ---
@@ -248,26 +208,19 @@ Server: Leaderboard shown.
 ### Navigation Commands
 
 #### `/lobby`
-Teleport to the lobby spawn point.
+Teleport to the configured lobby spawn point.
 
 **Usage:**
 ```
 /lobby
 ```
 
-**Aliases:** None
-
 **Permission Required:** None
-
-**Description:**
-- Instantly teleports you to the configured lobby
-- Available at any time (not during matches)
-- Returns you to the central gathering area
 
 **Example:**
 ```
 Player: /lobby
-Server: Teleported to lobby!
+Server: Welcome to the lobby!
 ```
 
 ---
@@ -282,20 +235,7 @@ Display all available commands and their descriptions.
 /help
 ```
 
-**Aliases:** None
-
 **Permission Required:** None
-
-**Shows:**
-- All player commands with descriptions
-- Admin commands (if you have permission)
-- Quick tips and usage notes
-
-**Example:**
-```
-Player: /help
-Server: [Shows formatted command list]
-```
 
 ---
 
@@ -304,59 +244,43 @@ Server: [Shows formatted command list]
 ### Arena Management
 
 #### `/arena`
-Manage arenas (create, edit, delete, list).
+Manage duel arenas (create, set spawns, save, list, delete, teleport, set radius).
 
 **Permission Required:** `hellisplugin.admin`
 
-**Subcommands:**
-
 ##### `/arena create <name>`
-Start creating a new arena.
+Start creating a new arena with the given name.
 
 **Usage:**
 ```
-/arena create "Arena 1"
+/arena create Arena1
+/arena create "CQC Arena 1"
 ```
-
-**Description:**
-- Initiates arena creation process
-- Requires setting two spawn points
-- Name must be unique
 
 ---
 
 ##### `/arena setspawn1`
-Set the first spawn point at your current position.
+Set spawn point 1 at your current position (during arena creation).
 
 **Usage:**
 ```
 /arena setspawn1
 ```
 
-**Description:**
-- Must be used during arena creation
-- Records your current position as spawn point 1
-- Move to a different location before setting spawn 2
-
 ---
 
 ##### `/arena setspawn2`
-Set the second spawn point at your current position.
+Set spawn point 2 at your current position (during arena creation).
 
 **Usage:**
 ```
 /arena setspawn2
 ```
 
-**Description:**
-- Must be used during arena creation
-- Records your current position as spawn point 2
-- Should face spawn point 1 for proper duels
-
 ---
 
 ##### `/arena save`
-Save the current arena being created.
+Save the arena currently being created.
 
 **Usage:**
 ```
@@ -365,80 +289,71 @@ Save the current arena being created.
 
 **Description:**
 - Finalizes arena creation
-- Saves to HellisPlugin_Arenas.json
+- Saves to `HellisPlugin_Arenas` data file
 - Arena becomes available for matches immediately
 
 ---
 
 ##### `/arena cancel`
-Cancel the current arena creation.
+Cancel the current arena creation in progress.
 
 **Usage:**
 ```
 /arena cancel
 ```
 
-**Description:**
-- Cancels arena creation in progress
-- Discards unsaved changes
-- Returns you to normal state
-
 ---
 
 ##### `/arena list`
-List all created arenas and their status.
+List all arenas and their current instance usage.
 
 **Usage:**
 ```
 /arena list
 ```
 
-**Description:**
-- Shows all arenas with instance usage
-- Displays active instances per arena
-- Shows which instances are occupied
-
-**Example:**
+**Example output:**
 ```
-Admin: /arena list
-Server:
-Available Arenas:
-- Arena 1 (3/5 instances active)
-  Active Instances: 0, 2, 4
-- Arena 2 (1/5 instances active)
-  Active Instances: 1
+=== Arenas ===
+Arena 1 - 2/5 instances active
+  Spawn 1: (100.0, 0.0, 200.0)
+  Spawn 2: (120.0, 0.0, 200.0)
+  Zone Radius: 30m
+  Active Instances: 0, 3
 ```
 
 ---
 
 ##### `/arena delete <name>`
-Delete an existing arena.
+Permanently delete an arena (must not be in use).
 
 **Usage:**
 ```
-/arena delete "Arena 1"
+/arena delete Arena1
+/arena delete "CQC Arena 1"
 ```
-
-**Description:**
-- Permanently removes the arena
-- Cannot be undone
-- Arena must not be in use
 
 ---
 
 ##### `/arena tp <name> [1|2]`
-Teleport to an arena for testing.
+Teleport to a spawn point of an arena for testing.
 
 **Usage:**
 ```
-/arena tp "Arena 1" 1
-/arena tp "Arena 1" 2
+/arena tp Arena1 1
+/arena tp Arena1 2
 ```
 
-**Description:**
-- Teleports you to the specified spawn point
-- Useful for testing arena positioning
-- Optional spawn number (1 or 2)
+---
+
+##### `/arena setradius <name> <radius>`
+Set the zone enforcement radius for an arena.
+
+**Usage:**
+```
+/arena setradius Arena1 30
+/arena setradius "CQC Arena 1" 50
+```
 
 ---
 
@@ -454,87 +369,199 @@ Set the lobby spawn position to your current location.
 
 **Permission Required:** `hellisplugin.admin`
 
-**Description:**
-- Records current position as lobby spawn
-- All players spawn here on connect
-- Players return here after matches
-
 **Example:**
 ```
 Admin: /lobby setpos
-Server: Lobby position set to your current location!
+Server: Lobby position set to: (0.0, 10.0, 0.0)
+```
+
+---
+
+#### `/lobby setradius <radius>`
+Set the lobby zone radius.
+
+**Usage:**
+```
+/lobby setradius 50
+```
+
+**Permission Required:** `hellisplugin.admin`
+
+---
+
+### Leaderboard Management
+
+#### `/clearleaderboard [confirm]`
+Clear all player statistics from the leaderboard.
+
+**Usage:**
+```
+/clearleaderboard
+/clearleaderboard confirm
+```
+
+**Permission Required:** `hellisplugin.admin`
+
+**Description:**
+- Without `confirm`: shows a warning prompt
+- With `confirm`: permanently deletes all player records
+
+**Example:**
+```
+Admin: /clearleaderboard confirm
+Server: ✅ Leaderboard cleared! Removed 42 player records.
 ```
 
 ---
 
 ## Console Commands (UI)
 
-These commands are automatically executed when players click buttons in the UI. They're not meant to be typed manually.
+These commands are executed automatically when players interact with UI buttons. They are not intended to be typed manually.
 
-### `duelui.join <mode>`
-Internal command executed when clicking weapon mode buttons.
+### Queue Buttons (Lobby Browser)
+
+#### `joinqueue.public`
+Join the public random-mode queue (AK47 / SAR / Bow / Revolver selected at random).
+
+**Trigger:** Click the **Public — JOIN** button in the lobby browser.
+
+---
+
+#### `joinqueue.ak`
+Join the AK47-only public queue.
+
+**Trigger:** Click the **Public AK — JOIN** button.
+
+---
+
+#### `joinqueue.bow`
+Join the Bow-only public queue.
+
+**Trigger:** Click the **Public Bow — JOIN** button.
+
+---
+
+#### `joinqueue.spear`
+Join the Speargun-only public queue (only visible when Speargun mode is enabled).
+
+**Trigger:** Click the **Speargun — JOIN** button.
+
+---
+
+#### `joinqueue.click`
+Join the random-mode queue via the legacy JOIN QUEUE button (Any mode).
+
+**Trigger:** Click the legacy **JOIN QUEUE** button (top-right, if visible).
+
+---
+
+### Leave Button
+
+#### `leavebutton.click`
+Leave the current queue or forfeit from an active match.
+
+**Trigger:** Click the **leave** button (bottom-right, visible while in queue or match).
+
+---
+
+### Private Room Buttons
+
+#### `lobby.createroom`
+Create a new private room named after your account.
+
+**Trigger:** Click **CREATE ROOM +** in the lobby browser.
+
+---
+
+#### `lobby.requestjoin <roomID>`
+Send a join request to a private room.
+
+**Trigger:** Click the **REQUEST** button next to a room listing.
+
+---
+
+#### `lobby.joinroom <roomID>`
+Alias for `lobby.requestjoin`. Forwards to the request flow.
+
+---
+
+#### `lobby.accept <playerID>`
+Accept a pending join request (room owner only).
+
+**Trigger:** Click **ACCEPT** in the join-request overlay.
+
+---
+
+#### `lobby.decline <playerID>`
+Decline a pending join request (room owner only).
+
+**Trigger:** Click **DECLINE** in the join-request overlay.
+
+---
+
+#### `lobby.leaveroom`
+Leave your current private room.
+
+**Trigger:** Click the **LEAVE** button inside a room entry.
+
+---
+
+#### `lobby.startmatch`
+Manually trigger matchmaking in your room (room owner only).
+
+**Trigger:** Owner action (programmatic, e.g. after accepting a player).
+
+---
+
+#### `lobby.roomguns`
+Open the weapon-mode selector for your room (room owner only).
+
+**Trigger:** Click the **GUNS** button inside your room entry.
+
+---
+
+#### `lobby.roomsetmode <mode>`
+Set the weapon mode for your room.
 
 **Parameters:**
-- `mode` - Weapon mode (AK, SAR, Spear, Bow, Rev)
+- `mode` — one of `AK47`, `SAR`, `Bow`, `Revolver`, `Random`, `Speargun`
 
-**Usage:** Automatic (via UI button clicks)
-
----
-
-### `duelui.leave`
-Internal command executed when clicking "Leave Queue" button.
-
-**Usage:** Automatic (via UI button click)
+**Trigger:** Click a mode button inside the weapon-mode selector UI.
 
 ---
 
-### `duelui.stats`
-Internal command executed when clicking "Stats" button.
+#### `lobby.closeguns`
+Close the weapon-mode selector UI.
 
-**Usage:** Automatic (via UI button click)
-
----
-
-### `duelui.leaderboard`
-Internal command executed when clicking "Leaderboard" button.
-
-**Usage:** Automatic (via UI button click)
-
----
-
-### `duelui.lobby`
-Internal command executed when clicking "Return to Lobby" button.
-
-**Usage:** Automatic (via UI button click)
-
----
-
-### `duelui.close`
-Internal command executed when clicking "Close UI" button.
-
-**Usage:** Automatic (via UI button click)
+**Trigger:** Click the **CLOSE** button in the weapon-mode selector.
 
 ---
 
 ## Permissions
 
 ### Player Permissions
-No permissions required - all player commands are available to everyone.
+
+| Permission | Description |
+|---|---|
+| `hellisplugin.use` | Required to use `/aimtrain` |
+
+All other player commands are available to everyone without any permission.
 
 ### Admin Permissions
 
-#### `hellisplugin.admin`
-Required for:
-- `/arena` (all subcommands)
-- `/lobby setpos`
+| Permission | Required For |
+|---|---|
+| `hellisplugin.admin` | All `/arena` subcommands, `/lobby setpos`, `/lobby setradius`, `/clearleaderboard` |
 
-**Granting Permission:**
+**Granting permissions via Oxide:**
 ```
 o.grant user <username> hellisplugin.admin
 o.grant group <groupname> hellisplugin.admin
+o.grant user <username> hellisplugin.use
+o.grant group default hellisplugin.use
 ```
 
-**Revoking Permission:**
+**Revoking permissions:**
 ```
 o.revoke user <username> hellisplugin.admin
 o.revoke group <groupname> hellisplugin.admin
@@ -546,9 +573,20 @@ o.revoke group <groupname> hellisplugin.admin
 
 ### For Players
 
-**Join a duel:**
+**Join a random match:**
 ```
-/duel ak
+Click the Public — JOIN button in the lobby browser (right side of screen)
+```
+
+**Join AK47-only queue:**
+```
+Click the Public AK — JOIN button
+```
+
+**Create a private room:**
+```
+Click CREATE ROOM + at the bottom of the lobby browser
+(Others can then REQUEST to join your room)
 ```
 
 **Check your stats:**
@@ -561,15 +599,15 @@ o.revoke group <groupname> hellisplugin.admin
 /leaderboard
 ```
 
-**Use the UI instead:**
-```
-/duelui
-(Click [AK] button to join queue)
-```
-
 **Return to lobby:**
 ```
 /lobby
+```
+
+**Toggle auto-requeue:**
+```
+/autorequeue on
+/autorequeue off
 ```
 
 ---
@@ -605,77 +643,44 @@ o.revoke group <groupname> hellisplugin.admin
 (Check other spawn)
 ```
 
----
-
-## Configuration
-
-Some command behavior can be modified in `oxide/config/HellisPlugin.json`:
-
-**Auto Show Duel UI:**
-```json
-"Auto Show Duel UI": true
+**Clear all stats:**
 ```
-- `true` - Duel UI shows automatically on player connect (default)
-- `false` - Players must use `/duelui` to show it manually
-
----
-
-## Tips & Tricks
-
-### For Players
-
-1. **Use the UI** - Much faster than typing commands
-2. **Toggle UIs** - Hide UIs if they're in the way during fights
-3. **Check stats regularly** - Track your improvement
-4. **Study the leaderboard** - See what K/D ratios top players have
-
-### For Admins
-
-1. **Test arenas** - Use `/arena tp` to verify spawn positions
-2. **Multiple arenas** - Create 3-5 arenas for better capacity
-3. **Multi-instance** - Each arena supports 5 simultaneous matches
-4. **Backup data** - Copy `oxide/data/HellisPlugin_*.json` files regularly
+/clearleaderboard confirm
+```
 
 ---
 
 ## Troubleshooting
 
-### "I don't see the UI buttons"
+### "I don't see the lobby browser or leaderboard"
 ```
-/duelui
+/showui
 ```
 
 ### "Command not working"
 - Check spelling
-- Make sure you're not in a match (for some commands)
-- Verify you have required permissions (for admin commands)
+- Ensure you are not in an active match (some commands are blocked during matches)
+- Verify you have the required permission (for admin commands)
 
 ### "Can't create arena"
-- Make sure you have `hellisplugin.admin` permission
-- Complete all steps: create → setspawn1 → setspawn2 → save
+- Ensure you have the `hellisplugin.admin` permission
+- Follow all steps: `/arena create` → `/arena setspawn1` → `/arena setspawn2` → `/arena save`
 
 ---
 
 ## Summary
 
-**Total Commands:** 18
-- **Player Commands:** 11
-- **Admin Commands:** 7 (1 main + 6 subcommands)
-- **Console Commands:** 6 (UI internal)
+**Chat Commands:** 14 total
+- **Player Commands:** 11 (`/leave`, `/forfeit`, `/autorequeue`, `/aimtrain`, `/stats`, `/leaderboard`, `/top`, `/toggleleaderboard`, `/showui`, `/lobby`, `/help`)
+- **Admin Commands:** 12 subcommands (`/arena create/setspawn1/setspawn2/save/cancel/list/delete/tp/setradius`, `/lobby setpos/setradius`, `/clearleaderboard`)
 
-**Most Used:**
-- `/duel <mode>` - Join queue
-- `/stats` - Check stats
-- `/leaderboard` - View rankings
-- `/duelui` - Toggle UI
-- `/lobby` - Return to lobby
+**Console Commands:** 16 (UI internal, triggered by button clicks)
 
 **For Complete Documentation:**
-- See `README.md` for overview
-- See `USER_GUIDE.md` for player guide
-- See `ADMIN_GUIDE.md` for admin guide
-- See `QUICK_REFERENCE.md` for quick lookup
+- See `README.md` for overview and configuration
+- See `ADMIN_GUIDE.md` for arena management guide
+- See `INSTALLATION.md` for setup instructions
 
 ---
 
-**Need Help?** Type `/help` in-game for a quick command list!
+**Need Help?** Type `/help` in-game for a quick command reference!

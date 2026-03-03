@@ -233,7 +233,7 @@ namespace Oxide.Plugins
         
         private void Init()
         {
-            queueManager = new QueueManager(config.EnableSpeargun);
+            queueManager = new QueueManager();
             arenaManager = new ArenaManager(arenas, config.MaxInstancesPerArena);
             loadoutManager = new LoadoutManager(config);
             aimTrainManager = new AimTrainManager();
@@ -1598,29 +1598,6 @@ namespace Oxide.Plugins
             }
         }
         
-        private DuelMode ParseDuelMode(string mode)
-        {
-            switch (mode.ToLower())
-            {
-                case "ak":
-                case "ak47":
-                    return DuelMode.AK47;
-                case "sar":
-                case "semiauto":
-                    return DuelMode.SAR;
-                case "speargun":
-                case "spear":
-                    return DuelMode.Speargun;
-                case "bow":
-                    return DuelMode.Bow;
-                case "revolver":
-                case "rev":
-                    return DuelMode.Revolver;
-                default:
-                    return DuelMode.None;
-            }
-        }
-        
         private void UpdatePlayerStats(ulong playerID, bool won, ActiveMatch match)
         {
             if (!playerData.ContainsKey(playerID))
@@ -2388,12 +2365,6 @@ namespace Oxide.Plugins
             TeleportToLobby(player);
         }
         
-        private DuelMode GetRandomMode()
-        {
-            // For JOIN QUEUE button, use Any mode to enable cross-mode matching
-            return DuelMode.Any;
-        }
-        
         [ConsoleCommand("joinqueue.click")]
         private void JoinQueueClickCommand(ConsoleSystem.Arg arg)
         {
@@ -2678,15 +2649,6 @@ namespace Oxide.Plugins
                 }
             }
             return null;
-        }
-        
-        private int GetQueuePlayerCount(QueueType queueType)
-        {
-            if (queuesByType.ContainsKey(queueType))
-            {
-                return queuesByType[queueType].Count;
-            }
-            return 0;
         }
         
         private void ProcessAllQueues()
@@ -3750,21 +3712,13 @@ namespace Oxide.Plugins
             Any  // For random queue matchmaking
         }
         
-        private class ModeButton
-        {
-            public string Label { get; set; }
-            public DuelMode Mode { get; set; }
-        }
-        
         public class QueueManager
         {
             private Dictionary<DuelMode, List<QueueEntry>> queues = new Dictionary<DuelMode, List<QueueEntry>>();
             private Dictionary<ulong, DuelMode> playerQueues = new Dictionary<ulong, DuelMode>();
-            private bool enableSpeargun;
             
-            public QueueManager(bool enableSpeargun = false)
+            public QueueManager()
             {
-                this.enableSpeargun = enableSpeargun;
                 queues[DuelMode.AK47] = new List<QueueEntry>();
                 queues[DuelMode.SAR] = new List<QueueEntry>();
                 queues[DuelMode.Speargun] = new List<QueueEntry>();
@@ -3794,14 +3748,6 @@ namespace Oxide.Plugins
             public bool IsQueued(ulong playerID)
             {
                 return playerQueues.ContainsKey(playerID);
-            }
-            
-            public int GetQueuePosition(ulong playerID)
-            {
-                if (!playerQueues.ContainsKey(playerID)) return -1;
-                
-                var mode = playerQueues[playerID];
-                return queues[mode].FindIndex(x => x.PlayerID == playerID);
             }
             
             public List<MatchPair> TryMatchAll()
@@ -3943,13 +3889,6 @@ namespace Oxide.Plugins
                 
                 // No available arena found (all arenas at max capacity)
                 return null;
-            }
-            
-            public void ReleaseArena(Arena arena)
-            {
-                // Deprecated - kept for backward compatibility
-                arena.InUse = false;
-                arena.ActiveInstances.Clear();
             }
             
             public void ReleaseArenaInstance(Arena arena, int instanceId)
@@ -4226,10 +4165,6 @@ namespace Oxide.Plugins
                 sessions[playerID] = new AimTrainSession { PlayerID = playerID };
             }
             
-            public void EndSession(ulong playerID)
-            {
-                sessions.Remove(playerID);
-            }
         }
         
         public class AimTrainSession
