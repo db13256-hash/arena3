@@ -29,6 +29,7 @@ namespace Oxide.Plugins
         private HashSet<ulong> autoRequeueOptOut = new HashSet<ulong>(); // Track players who opted out of auto-requeue
         private HashSet<ulong> activeJoinRequestUIs = new HashSet<ulong>(); // Track players with pending-request overlay open
         private List<ArenaConfig> arenas = new List<ArenaConfig>(); // Arena storage (stored in data file, not config)
+        private Dictionary<ulong, string> leaderboardTabs = new Dictionary<ulong, string>(); // Active leaderboard tab per player
         
         // Lobby browser system
         private Dictionary<QueueType, List<ulong>> queuesByType = new Dictionary<QueueType, List<ulong>>();
@@ -1645,6 +1646,12 @@ namespace Oxide.Plugins
                 data.StatEvents.Add(new StatEvent { Type = "Loss", Timestamp = DateTime.Now });
             }
             
+            // Record per-queue win/loss
+            string queueKey = GetMatchQueueKey(match);
+            var queueDict = won ? data.WinsByQueue : data.LossesByQueue;
+            if (!queueDict.ContainsKey(queueKey)) queueDict[queueKey] = 0;
+            queueDict[queueKey]++;
+            
             if (playerID == match.Player1ID)
             {
                 data.RoundsWon += match.Player1Score;
@@ -1677,6 +1684,32 @@ namespace Oxide.Plugins
             }
             
             data.WinRate = (float)data.Wins / data.TotalMatches * 100f;
+        }
+        
+        // Returns the leaderboard key for the queue type a match was played in.
+        // RoomID is checked first so private-room matches are never misclassified as public.
+        // The SourceQueueType fallback to "Public" only applies to the legacy queueManager system,
+        // which only ever ran public (random-mode) matches.
+        private string GetMatchQueueKey(ActiveMatch match)
+        {
+            if (match.RoomID != null) return "Private";
+            if (!match.SourceQueueType.HasValue) return "Public"; // Legacy fallback
+            switch (match.SourceQueueType.Value)
+            {
+                case QueueType.PublicAK:       return "AK";
+                case QueueType.PublicBow:      return "Bow";
+                case QueueType.PublicSpeargun: return "Speargun";
+                default:                       return "Public";
+            }
+        }
+        
+        // Returns win rate (0-100) for a specific queue key, or 0 when no games played.
+        private float GetQueueWinRate(PlayerData data, string queueKey)
+        {
+            int w = data.WinsByQueue.ContainsKey(queueKey)  ? data.WinsByQueue[queueKey]  : 0;
+            int l = data.LossesByQueue.ContainsKey(queueKey) ? data.LossesByQueue[queueKey] : 0;
+            int total = w + l;
+            return total > 0 ? (float)w / total * 100f : 0f;
         }
         
         private void UpdateWinRate(ulong playerID)
@@ -2585,6 +2618,16 @@ namespace Oxide.Plugins
             CuiHelper.DestroyUi(player, "RoomGunSelect");
         }
         
+        [ConsoleCommand("leaderboard.tab")]
+        private void LeaderboardTabCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null || arg.Args == null || arg.Args.Length == 0) return;
+            leaderboardTabs[player.userID] = arg.Args[0];
+            if (activeLeaderboardUIs.Contains(player.userID))
+                ShowLeaderboardUI(player);
+        }
+        
         #endregion
         
         #region Phase 3 - Queue Management
@@ -3209,109 +3252,155 @@ namespace Oxide.Plugins
         {
             if (player == null) return;
             
-            DestroyLeaderboardUI(player); // Clean up any existing leaderboard UI
+            DestroyLeaderboardUI(player);
+            
+            // Get active tab (default to "Public")
+            if (!leaderboardTabs.ContainsKey(player.userID))
+                leaderboardTabs[player.userID] = "Public";
+            string activeTab = leaderboardTabs[player.userID];
             
             var elements = new CuiElementContainer();
             
-            // Main panel - top left corner (narrower with bigger text)
+            // Main panel - top left, dark gray matching the lobby browser
             var mainPanel = elements.Add(new CuiPanel
             {
-                Image = { Color = "0.1 0.1 0.1 0.85" },
-                RectTransform = { AnchorMin = "0.01 0.70", AnchorMax = "0.19 0.99" },
+                Image = { Color = "0.17 0.17 0.17 0.95" },
+                RectTransform = { AnchorMin = "0.01 0.57", AnchorMax = "0.25 0.99" },
                 CursorEnabled = false
             }, "Hud", "LeaderboardUI");
             
-            // Title
+            // Title - cyan, matching lobby browser header
             elements.Add(new CuiLabel
             {
-                Text = { Text = "🏆 GLOBAL LEADERBOARD", FontSize = 16, Align = TextAnchor.UpperCenter, Color = "1 0.8 0 1" },
-                RectTransform = { AnchorMin = "0.05 0.92", AnchorMax = "0.95 0.98" }
+                Text = { Text = "🏆 LEADERBOARD", FontSize = 14, Align = TextAnchor.MiddleCenter, Color = "0 0.8 0.82 1" },
+                RectTransform = { AnchorMin = "0.05 0.93", AnchorMax = "0.95 0.99" }
             }, mainPanel);
             
-            // Get top 10 players - Filter by time window (last X minutes)
+            // Separator under title
+            elements.Add(new CuiPanel
+            {
+                Image = { Color = "0 0.8 0.82 0.3" },
+                RectTransform = { AnchorMin = "0.03 0.924", AnchorMax = "0.97 0.930" }
+            }, mainPanel);
+            
+            // ---- Tab buttons ----
+            var tabs = new List<(string Key, string Label)>
+            {
+                ("Public",  "Public"),
+                ("AK",      "AK47"),
+                ("Bow",     "Bow"),
+                ("Private", "Private"),
+            };
+            if (config.EnableSpeargun)
+                tabs.Insert(3, ("Speargun", "Spear"));
+            
+            int tabCount = tabs.Count;
+            float tabLeft  = 0.03f;
+            float tabRight = 0.97f;
+            float tabGap   = 0.01f;
+            float tabW     = (tabRight - tabLeft - tabGap * (tabCount - 1)) / tabCount;
+            float tabBotY  = 0.865f;
+            float tabTopY  = 0.920f;
+            
+            for (int i = 0; i < tabs.Count; i++)
+            {
+                var (tabKey, tabLabel) = tabs[i];
+                float xMin = tabLeft + i * (tabW + tabGap);
+                float xMax = xMin + tabW;
+                bool  active    = tabKey == activeTab;
+                string btnColor = active ? "0 0.8 0.82 0.85" : "0.22 0.22 0.22 0.9";
+                string txtColor = active ? "1 1 1 1"          : "0.65 0.65 0.65 1";
+                
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = $"leaderboard.tab {tabKey}", Color = btnColor },
+                    RectTransform = { AnchorMin = $"{xMin:F3} {tabBotY:F3}", AnchorMax = $"{xMax:F3} {tabTopY:F3}" },
+                    Text   = { Text = tabLabel, FontSize = 10, Align = TextAnchor.MiddleCenter, Color = txtColor }
+                }, mainPanel);
+            }
+            
+            // Separator under tabs
+            elements.Add(new CuiPanel
+            {
+                Image = { Color = "0 0.8 0.82 0.3" },
+                RectTransform = { AnchorMin = "0.03 0.858", AnchorMax = "0.97 0.864" }
+            }, mainPanel);
+            
+            // ---- Leaderboard entries for active tab ----
             var cutoffTime = DateTime.Now.AddMinutes(-config.LeaderboardTimeWindowMinutes);
+            
             var topPlayers = playerData
-                .Where(p => p.Value.LastMatchTime >= cutoffTime) // Only show players with recent matches
-                .OrderByDescending(p => p.Value.WinRate)
-                .ThenByDescending(p => p.Value.Wins)
+                .Where(p => (p.Value.WinsByQueue.ContainsKey(activeTab) || p.Value.LossesByQueue.ContainsKey(activeTab))
+                            && p.Value.LastMatchTime >= cutoffTime)
+                .OrderByDescending(p => p.Value.WinsByQueue.ContainsKey(activeTab) ? p.Value.WinsByQueue[activeTab] : 0)
+                .ThenByDescending(p => GetQueueWinRate(p.Value, activeTab))
                 .Take(10)
                 .ToList();
             
-            // Display leaderboard entries
-            float startY = 0.88f;
+            float startY      = 0.845f;
             float entryHeight = 0.08f;
-            int rank = 1;
+            int   rank        = 1;
             
             if (topPlayers.Count == 0)
             {
-                // No recent matches - show message
                 elements.Add(new CuiLabel
                 {
-                    Text = { Text = $"No matches in the\nlast {config.LeaderboardTimeWindowMinutes} minutes", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = "0.8 0.8 0.8 1" },
+                    Text = { Text = $"No {activeTab} matches\nin the last {config.LeaderboardTimeWindowMinutes} min",
+                             FontSize = 11, Align = TextAnchor.MiddleCenter, Color = "0.6 0.6 0.6 1" },
                     RectTransform = { AnchorMin = "0.05 0.40", AnchorMax = "0.95 0.60" }
                 }, mainPanel);
             }
             
             foreach (var entry in topPlayers)
             {
-                var playerName = covalence.Players.FindPlayerById(entry.Key.ToString())?.Name ?? "Unknown";
-                if (playerName.Length > 12) playerName = playerName.Substring(0, 12); // Truncate long names
+                var   playerName = covalence.Players.FindPlayerById(entry.Key.ToString())?.Name ?? "Unknown";
+                if (playerName.Length > 12) playerName = playerName.Substring(0, 12);
                 
-                var stats = entry.Value;
+                int   w    = entry.Value.WinsByQueue.ContainsKey(activeTab)  ? entry.Value.WinsByQueue[activeTab]  : 0;
+                int   l    = entry.Value.LossesByQueue.ContainsKey(activeTab) ? entry.Value.LossesByQueue[activeTab] : 0;
+                float wr   = GetQueueWinRate(entry.Value, activeTab);
+                string txt = $"{rank}. {playerName}  {w}W-{l}L ({wr:F0}%)";
                 
-                // Calculate K/D ratio from rolling stats (last X minutes only)
-                int recentKills = GetRecentKills(stats, config.LeaderboardTimeWindowMinutes);
-                int recentDeaths = GetRecentDeaths(stats, config.LeaderboardTimeWindowMinutes);
-                float kd = recentDeaths > 0 ? (float)recentKills / recentDeaths : recentKills;
-                
-                // Get recent wins/losses for display
-                int recentWins = GetRecentWins(stats, config.LeaderboardTimeWindowMinutes);
-                int recentLosses = GetRecentLosses(stats, config.LeaderboardTimeWindowMinutes);
-                
-                string entryText = $"{rank}. {playerName} ({recentWins}-{recentLosses}) K/D: {kd:F2}";
-                
-                // Highlight current player
-                string textColor = (entry.Key == player.userID) ? "1 1 0 1" : "0.9 0.9 0.9 1";
+                string textColor = entry.Key == player.userID ? "1 1 0 1" : "0.9 0.9 0.9 1";
                 
                 elements.Add(new CuiLabel
                 {
-                    Text = { Text = entryText, FontSize = 12, Align = TextAnchor.UpperLeft, Color = textColor },
-                    RectTransform = { AnchorMin = $"0.05 {startY - entryHeight}", AnchorMax = $"0.95 {startY}" }
+                    Text = { Text = txt, FontSize = 11, Align = TextAnchor.UpperLeft, Color = textColor },
+                    RectTransform = { AnchorMin = $"0.05 {startY - entryHeight:F3}", AnchorMax = $"0.95 {startY:F3}" }
                 }, mainPanel);
                 
                 startY -= entryHeight;
                 rank++;
-                
-                if (rank > 10) break; // Only show top 10
+                if (rank > 10) break;
             }
             
-            // Footer with player's rank if not in top 10
+            // Footer: show viewer's own rank when outside top 10
             if (playerData.ContainsKey(player.userID))
             {
-                var playerRank = playerData
-                    .Where(p => p.Value.LastMatchTime >= cutoffTime) // Use same time filter
-                    .OrderByDescending(p => p.Value.WinRate)
-                    .ThenByDescending(p => p.Value.Wins)
-                    .ToList()
-                    .FindIndex(p => p.Key == player.userID) + 1;
+                var yourData = playerData[player.userID];
+                int yourW = yourData.WinsByQueue.ContainsKey(activeTab)  ? yourData.WinsByQueue[activeTab]  : 0;
+                int yourL = yourData.LossesByQueue.ContainsKey(activeTab) ? yourData.LossesByQueue[activeTab] : 0;
                 
-                if (playerRank > 10)
+                if (yourW > 0 || yourL > 0)
                 {
-                    var yourStats = playerData[player.userID];
-                    // Calculate from rolling stats
-                    int yourRecentKills = GetRecentKills(yourStats, config.LeaderboardTimeWindowMinutes);
-                    int yourRecentDeaths = GetRecentDeaths(yourStats, config.LeaderboardTimeWindowMinutes);
-                    float yourKd = yourRecentDeaths > 0 ? (float)yourRecentKills / yourRecentDeaths : yourRecentKills;
+                    int yourRank = playerData
+                        .Where(p => (p.Value.WinsByQueue.ContainsKey(activeTab) || p.Value.LossesByQueue.ContainsKey(activeTab))
+                                    && p.Value.LastMatchTime >= cutoffTime)
+                        .OrderByDescending(p => p.Value.WinsByQueue.ContainsKey(activeTab) ? p.Value.WinsByQueue[activeTab] : 0)
+                        .ThenByDescending(p => GetQueueWinRate(p.Value, activeTab))
+                        .ToList()
+                        .FindIndex(p => p.Key == player.userID) + 1;
                     
-                    int yourRecentWins = GetRecentWins(yourStats, config.LeaderboardTimeWindowMinutes);
-                    int yourRecentLosses = GetRecentLosses(yourStats, config.LeaderboardTimeWindowMinutes);
-                    string footerText = $"Your Rank: #{playerRank}\n{yourRecentWins}W-{yourRecentLosses}L | K/D: {yourKd:F2}";
-                    
-                    elements.Add(new CuiLabel
+                    if (yourRank > 10)
                     {
-                        Text = { Text = footerText, FontSize = 11, Align = TextAnchor.LowerCenter, Color = "1 1 0 1" },
-                        RectTransform = { AnchorMin = "0.05 0.02", AnchorMax = "0.95 0.10" }
-                    }, mainPanel);
+                        float yourWr = GetQueueWinRate(yourData, activeTab);
+                        elements.Add(new CuiLabel
+                        {
+                            Text = { Text = $"Your rank: #{yourRank}  {yourW}W-{yourL}L ({yourWr:F0}%)",
+                                     FontSize = 10, Align = TextAnchor.MiddleCenter, Color = "1 1 0 1" },
+                            RectTransform = { AnchorMin = "0.03 0.01", AnchorMax = "0.97 0.07" }
+                        }, mainPanel);
+                    }
                 }
             }
             
@@ -4176,6 +4265,10 @@ namespace Oxide.Plugins
             public int RoundsLost = 0;
             public float WinRate = 0f;
             public DateTime LastMatchTime = DateTime.MinValue;
+            
+            // Per-queue-type win/loss counts (keys: "Public", "AK", "Bow", "Speargun", "Private")
+            public Dictionary<string, int> WinsByQueue = new Dictionary<string, int>();
+            public Dictionary<string, int> LossesByQueue = new Dictionary<string, int>();
             
             // Event-based stats for rolling leaderboard
             public List<StatEvent> StatEvents = new List<StatEvent>();
