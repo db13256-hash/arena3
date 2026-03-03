@@ -536,6 +536,10 @@ namespace Oxide.Plugins
                     // Hide from all other players
                     return false;
                 }
+                
+                // Neither player is in a match — both are in the lobby.
+                // All non-match players on this server are in the lobby, so hide them from each other.
+                return false;
             }
             
             return null; // Default behavior
@@ -575,7 +579,18 @@ namespace Oxide.Plugins
             }
             else
             {
-                SendReply(player, "You're not in queue.");
+                // Check if player is in a private room waiting queue
+                var roomID = GetPlayerRoom(player.userID);
+                if (roomID != null)
+                {
+                    LeaveRoom(player, roomID);
+                    TeleportToLobby(player);
+                    ShowLobbyBrowser(player);
+                }
+                else
+                {
+                    SendReply(player, "You're not in queue.");
+                }
             }
         }
         
@@ -2296,7 +2311,10 @@ namespace Oxide.Plugins
                 return;
             }
             
-            // Not in queue or match - just send to lobby
+            // Not in queue or match - also leave any private room, then go to lobby
+            var catchAllRoomID = GetPlayerRoom(player.userID);
+            if (catchAllRoomID != null)
+                LeaveRoom(player, catchAllRoomID);
             DestroyLeaveButton(player);
             TeleportToLobby(player);
         }
