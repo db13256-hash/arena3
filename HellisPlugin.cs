@@ -1897,12 +1897,12 @@ namespace Oxide.Plugins
             
             var elements = new CuiElementContainer();
             
-            // Main panel - right side, dark gray background
+            // Main panel - top right, dark gray background
             // CursorEnabled = false so the panel doesn't capture the cursor and lock camera rotation
             elements.Add(new CuiPanel
             {
                 Image = { Color = "0.17 0.17 0.17 0.95" }, // Dark gray #2B2B2B
-                RectTransform = { AnchorMin = "0.70 0.15", AnchorMax = "0.98 0.85" },
+                RectTransform = { AnchorMin = "0.70 0.30", AnchorMax = "0.98 0.99" },
                 CursorEnabled = false
             }, "Hud", "LobbyBrowser");
             
@@ -3265,7 +3265,7 @@ namespace Oxide.Plugins
             var mainPanel = elements.Add(new CuiPanel
             {
                 Image = { Color = "0.17 0.17 0.17 0.95" },
-                RectTransform = { AnchorMin = "0.01 0.57", AnchorMax = "0.25 0.99" },
+                RectTransform = { AnchorMin = "0.01 0.68", AnchorMax = "0.20 0.99" },
                 CursorEnabled = false
             }, "Hud", "LeaderboardUI");
             
