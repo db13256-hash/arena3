@@ -2193,8 +2193,8 @@ namespace Oxide.Plugins
                 modeList.Add(("Speargun", DuelMode.Speargun));
             
             float btnY = 0.84f;
-            float btnH = 0.12f;
-            float gap = 0.02f;
+            float btnH = 0.11f;
+            float gap = 0.01f;
             foreach (var (label, mode) in modeList)
             {
                 bool selected = room.Mode == mode;
@@ -2211,11 +2211,13 @@ namespace Oxide.Plugins
                 btnY -= btnH + gap;
             }
             
-            // CLOSE button
+            // CLOSE button — position dynamically below last mode button so it never overlaps
+            float closeBtnMax = btnY - gap;
+            float closeBtnMin = closeBtnMax - 0.10f;
             elements.Add(new CuiButton
             {
                 Button = { Command = "lobby.closeguns", Color = "0.55 0.1 0.1 0.9" },
-                RectTransform = { AnchorMin = "0.08 0.02", AnchorMax = "0.92 0.10" },
+                RectTransform = { AnchorMin = $"0.08 {closeBtnMin:F4}", AnchorMax = $"0.92 {closeBtnMax:F4}" },
                 Text = { Text = "CLOSE", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
             }, "RoomGunSelect");
             
