@@ -500,9 +500,13 @@ namespace Oxide.Plugins
                 SendReply(player, "⚠ Lobby not configured. Admin: use /lobby setpos to set lobby location.");
             }
             
-            // Force network re-evaluation so CanNetworkTo is applied to this player
-            // for all current lobby viewers (makes lobby players invisible to each other).
-            player.SendNetworkUpdateImmediate();
+            // Force network re-evaluation for ALL connected players so CanNetworkTo is
+            // applied in every direction, making lobby players invisible to each other.
+            foreach (var p in BasePlayer.activePlayerList)
+            {
+                if (p != null && p.IsConnected)
+                    p.SendNetworkUpdateImmediate();
+            }
         }
         
         private object CanNetworkTo(BaseNetworkable entity, BasePlayer target)
@@ -1478,6 +1482,14 @@ namespace Oxide.Plugins
                     player.Teleport(spawnPoint.pos);
                 }
             }
+            
+            // Force network re-evaluation for ALL connected players so CanNetworkTo is
+            // applied in every direction, making lobby players invisible to each other.
+            foreach (var p in BasePlayer.activePlayerList)
+            {
+                if (p != null && p.IsConnected)
+                    p.SendNetworkUpdateImmediate();
+            }
         }
         
         private void GiveLoadout(BasePlayer player, DuelMode mode)
@@ -2308,6 +2320,21 @@ namespace Oxide.Plugins
                     DestroyLeaveButton(opponent);
                     TeleportToLobby(opponent);
                     ShowLobbyBrowser(opponent); // Show lobby browser instead
+                }
+                
+                // For room matches: re-add the remaining player (opponent) to the waiting
+                // queue so the next match can start when someone rejoins the room.
+                string matchRoomID = match.RoomID;
+                if (matchRoomID != null && privateRooms.ContainsKey(matchRoomID))
+                {
+                    var room = privateRooms[matchRoomID];
+                    if (opponent != null && opponent.IsConnected
+                        && room.PlayerIDs.Contains(opponentID)
+                        && !room.WaitingQueue.Contains(opponentID))
+                    {
+                        room.WaitingQueue.Add(opponentID);
+                    }
+                    timer.Once(1.5f, () => TryRoomMatchmaking(matchRoomID));
                 }
                 
                 SavePlayerData();
