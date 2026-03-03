@@ -1218,6 +1218,10 @@ namespace Oxide.Plugins
             ShowLeaveButton(player1);
             ShowLeaveButton(player2);
             
+            // Immediately show leaderboard scoped to this match's queue
+            ShowLeaderboardUI(player1);
+            ShowLeaderboardUI(player2);
+            
             // Start countdown (silent - no chat messages)
             timer.Once(config.CountdownDuration, () => StartRound(match));
         }
@@ -1420,6 +1424,7 @@ namespace Oxide.Plugins
                 {
                     DestroyLeaveButton(player1);
                     ShowLobbyBrowser(player1);
+                    ShowLeaderboardUI(player1); // Reset leaderboard to lobby (Public) context
                     if (GetPlayerQueueType(player1.userID).HasValue)
                         ShowLeaveButton(player1);
                     // Show pending join requests to room owner after match
@@ -1434,6 +1439,7 @@ namespace Oxide.Plugins
                 {
                     DestroyLeaveButton(player2);
                     ShowLobbyBrowser(player2);
+                    ShowLeaderboardUI(player2); // Reset leaderboard to lobby (Public) context
                     if (GetPlayerQueueType(player2.userID).HasValue)
                         ShowLeaveButton(player2);
                     var ownedRoomID = GetOwnedRoom(player2.userID);
@@ -2370,12 +2376,14 @@ namespace Oxide.Plugins
                     LeaveRoom(player, forfeiterRoomID);
                 }
                 ShowLobbyBrowser(player); // Show lobby browser instead
+                ShowLeaderboardUI(player); // Reset leaderboard to lobby (Public) context
                 
                 if (opponent != null && opponent.IsConnected)
                 {
                     DestroyLeaveButton(opponent);
                     TeleportToLobby(opponent);
                     ShowLobbyBrowser(opponent); // Show lobby browser instead
+                    ShowLeaderboardUI(opponent); // Reset leaderboard to lobby (Public) context
                 }
                 
                 // For room matches: re-add the remaining player (opponent) to the waiting
