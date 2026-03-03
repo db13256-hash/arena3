@@ -475,8 +475,6 @@ namespace Oxide.Plugins
                     // Phase 2: Show lobby browser instead of simple button
                     ShowLobbyBrowser(player);
                     
-                    ShowLeaderboardUI(player); // Show persistent leaderboard (always)
-                    
                     // Send welcome and instructions
                     SendReply(player, "═══════════════════════════════════════");
                     SendReply(player, "Welcome to Hellis Duels!");
@@ -727,10 +725,9 @@ namespace Oxide.Plugins
         private void ShowUICommand(BasePlayer player, string command, string[] args)
         {
             ShowLobbyBrowser(player); // Show lobby browser instead of old button
-            ShowLeaderboardUI(player);
             SendReply(player, "UI elements refreshed!");
             SendReply(player, "Lobby Browser: Right side");
-            SendReply(player, "Leaderboard: Top left");
+            SendReply(player, "Leaderboard: visible during active matches only");
             SendReply(player, "If you still don't see them, you may need to enable your cursor with F1 menu.");
         }
         
@@ -747,7 +744,6 @@ namespace Oxide.Plugins
                     continue;
                 
                 ShowLobbyBrowser(player); // Show lobby browser instead of old button
-                ShowLeaderboardUI(player);
                 
                 // Restore leave button for players waiting in a Phase 3 queue
                 if (GetPlayerQueueType(player.userID).HasValue || queueManager.IsQueued(player.userID))
@@ -1423,8 +1419,8 @@ namespace Oxide.Plugins
                 if (player1 != null && player1.IsConnected && !activeMatches.ContainsKey(player1.userID))
                 {
                     DestroyLeaveButton(player1);
+                    DestroyLeaderboardUI(player1); // Hide leaderboard when returning to lobby
                     ShowLobbyBrowser(player1);
-                    ShowLeaderboardUI(player1); // Reset leaderboard to lobby (Public) context
                     if (GetPlayerQueueType(player1.userID).HasValue)
                         ShowLeaveButton(player1);
                     // Show pending join requests to room owner after match
@@ -1438,8 +1434,8 @@ namespace Oxide.Plugins
                 if (player2 != null && player2.IsConnected && !activeMatches.ContainsKey(player2.userID))
                 {
                     DestroyLeaveButton(player2);
+                    DestroyLeaderboardUI(player2); // Hide leaderboard when returning to lobby
                     ShowLobbyBrowser(player2);
-                    ShowLeaderboardUI(player2); // Reset leaderboard to lobby (Public) context
                     if (GetPlayerQueueType(player2.userID).HasValue)
                         ShowLeaveButton(player2);
                     var ownedRoomID = GetOwnedRoom(player2.userID);
@@ -2388,14 +2384,14 @@ namespace Oxide.Plugins
                     LeaveRoom(player, forfeiterRoomID);
                 }
                 ShowLobbyBrowser(player); // Show lobby browser instead
-                ShowLeaderboardUI(player); // Reset leaderboard to lobby (Public) context
+                DestroyLeaderboardUI(player); // Hide leaderboard when returning to lobby
                 
                 if (opponent != null && opponent.IsConnected)
                 {
                     DestroyLeaveButton(opponent);
                     TeleportToLobby(opponent);
                     ShowLobbyBrowser(opponent); // Show lobby browser instead
-                    ShowLeaderboardUI(opponent); // Reset leaderboard to lobby (Public) context
+                    DestroyLeaderboardUI(opponent); // Hide leaderboard when returning to lobby
                 }
                 
                 // For room matches: re-add the remaining player (opponent) to the waiting
@@ -3282,6 +3278,13 @@ namespace Oxide.Plugins
                 CursorEnabled = false
             }, "Hud", "LeaderboardUI");
             
+            // Title background strip (teal tint so title area stands out)
+            elements.Add(new CuiPanel
+            {
+                Image = { Color = "0 0.8 0.82 0.2" },
+                RectTransform = { AnchorMin = "0 0.91", AnchorMax = "1 1" }
+            }, mainPanel);
+            
             // Title showing current queue context
             string titleText = queueKey == "Private"  ? "PRIVATE" :
                                queueKey == "AK"       ? "PUBLIC AK47" :
@@ -3290,15 +3293,22 @@ namespace Oxide.Plugins
                                                         "PUBLIC";
             elements.Add(new CuiLabel
             {
-                Text = { Text = titleText, FontSize = 14, Align = TextAnchor.MiddleCenter, Color = "0 0.8 0.82 1" },
-                RectTransform = { AnchorMin = "0.05 0.93", AnchorMax = "0.95 0.99" }
+                Text = { Text = titleText, FontSize = 15, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" },
+                RectTransform = { AnchorMin = "0.03 0.935", AnchorMax = "0.97 0.99" }
             }, mainPanel);
             
-            // Separator under title
+            // "Last N min" sub-label confirms the time filter
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = $"Last {config.LeaderboardTimeWindowMinutes} min", FontSize = 9, Align = TextAnchor.MiddleCenter, Color = "0.7 0.7 0.7 1" },
+                RectTransform = { AnchorMin = "0.03 0.910", AnchorMax = "0.97 0.935" }
+            }, mainPanel);
+            
+            // Separator under title area
             elements.Add(new CuiPanel
             {
-                Image = { Color = "0 0.8 0.82 0.3" },
-                RectTransform = { AnchorMin = "0.03 0.924", AnchorMax = "0.97 0.930" }
+                Image = { Color = "0 0.8 0.82 0.4" },
+                RectTransform = { AnchorMin = "0.03 0.906", AnchorMax = "0.97 0.910" }
             }, mainPanel);
             
             // ---- Leaderboard entries ----
@@ -3325,7 +3335,7 @@ namespace Oxide.Plugins
                     .ToList();
             }
             
-            float startY      = 0.910f;
+            float startY      = 0.900f;
             float entryHeight = 0.08f;
             int   rank        = 1;
             
