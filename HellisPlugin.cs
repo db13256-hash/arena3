@@ -487,6 +487,9 @@ namespace Oxide.Plugins
         {
             if (player == null || !player.IsConnected) return;
             
+            // Always clear inventory so players arrive in the lobby with nothing
+            player.inventory.Strip();
+            
             if (arenaManager.IsLobbySet())
             {
                 player.Teleport(arenaManager.GetLobbyPosition());
@@ -900,7 +903,7 @@ namespace Oxide.Plugins
             {
                 case "setpos":
                     arenaManager.SetLobby(player.transform.position, arenaManager.GetLobbyRadius());
-                    SaveArenas();
+                    SaveLobbyData();
                     SendReply(player, $"Lobby position set to: {player.transform.position}");
                     break;
                     
@@ -915,7 +918,7 @@ namespace Oxide.Plugins
                     if (float.TryParse(args[1], out lobbyRadius) && lobbyRadius > 0)
                     {
                         arenaManager.SetLobby(arenaManager.GetLobbyPosition(), lobbyRadius);
-                        SaveArenas();
+                        SaveLobbyData();
                         SendReply(player, $"Lobby radius set to: {lobbyRadius}m");
                     }
                     else
@@ -3571,11 +3574,54 @@ namespace Oxide.Plugins
         {
             LoadPlayerData();
             LoadArenas();
+            LoadLobbyData();
         }
         
         private void SaveData()
         {
             SavePlayerData();
+            SaveLobbyData();
+        }
+        
+        private void LoadLobbyData()
+        {
+            try
+            {
+                var data = Interface.Oxide.DataFileSystem.ReadObject<LobbyData>("HellisPlugin_Lobby");
+                if (data != null && data.IsSet)
+                {
+                    arenaManager.SetLobby(data.Position, data.Radius);
+                    Puts($"Loaded lobby position from data file");
+                }
+            }
+            catch (Exception ex)
+            {
+                Puts($"Error loading lobby data: {ex.Message}");
+            }
+        }
+        
+        private void SaveLobbyData()
+        {
+            try
+            {
+                Interface.Oxide.DataFileSystem.WriteObject("HellisPlugin_Lobby", new LobbyData
+                {
+                    Position = arenaManager.GetLobbyPosition(),
+                    Radius = arenaManager.GetLobbyRadius(),
+                    IsSet = arenaManager.IsLobbySet()
+                });
+            }
+            catch (Exception ex)
+            {
+                Puts($"Error saving lobby data: {ex.Message}");
+            }
+        }
+        
+        private class LobbyData
+        {
+            public Vector3 Position;
+            public float Radius = 10f;
+            public bool IsSet;
         }
         
         private void Unload()
@@ -3597,6 +3643,7 @@ namespace Oxide.Plugins
             // Save all data on plugin unload
             SavePlayerData();
             SaveArenas();
+            SaveLobbyData();
             Puts("HellisPlugin unloaded - all data saved");
         }
         
@@ -3762,6 +3809,11 @@ namespace Oxide.Plugins
             private int maxInstancesPerArena;
             private int lastArenaIndex = -1; // Track last used arena for round-robin distribution
             
+            // Lobby state stored independently of arenas
+            private Vector3 lobbyPosition;
+            private float lobbyRadius = 10f;
+            private bool lobbyPositionSet;
+            
             public ArenaManager(List<ArenaConfig> configs, int maxInstances = 5)
             {
                 maxInstancesPerArena = maxInstances;
@@ -3860,33 +3912,17 @@ namespace Oxide.Plugins
             }
             
             // Lobby helper methods
-            public Vector3 GetLobbyPosition()
-            {
-                // Get lobby from first arena (or default if none)
-                return arenas.Count > 0 && arenas[0].LobbyPositionSet 
-                    ? arenas[0].LobbyPosition 
-                    : Vector3.zero;
-            }
+            public Vector3 GetLobbyPosition() => lobbyPosition;
             
-            public float GetLobbyRadius()
-            {
-                // Get lobby radius from first arena (or default)
-                return arenas.Count > 0 ? arenas[0].LobbyRadius : 10f;
-            }
+            public float GetLobbyRadius() => lobbyRadius;
             
-            public bool IsLobbySet()
-            {
-                return arenas.Count > 0 && arenas[0].LobbyPositionSet;
-            }
+            public bool IsLobbySet() => lobbyPositionSet;
             
             public void SetLobby(Vector3 position, float radius)
             {
-                // Set lobby for first arena (ensure at least one arena exists)
-                if (arenas.Count == 0) return;
-                
-                arenas[0].LobbyPosition = position;
-                arenas[0].LobbyRadius = radius;
-                arenas[0].LobbyPositionSet = true;
+                lobbyPosition = position;
+                lobbyRadius = radius;
+                lobbyPositionSet = true;
             }
         }
         
