@@ -2336,6 +2336,19 @@ namespace Oxide.Plugins
                     }
                     timer.Once(1.5f, () => TryRoomMatchmaking(matchRoomID));
                 }
+                else if (opponent != null && opponent.IsConnected)
+                {
+                    // Public match: auto-requeue the opponent (they didn't forfeit)
+                    if (!autoRequeueOptOut.Contains(opponentID))
+                    {
+                        queueManager.JoinQueue(opponentID, opponent.displayName, DuelMode.Any);
+                        SendReply(opponent, "✓ Auto-requeued for random match!");
+                    }
+                    else
+                    {
+                        SendReply(opponent, "Auto-requeue disabled. Click JOIN QUEUE to play again.");
+                    }
+                }
                 
                 SavePlayerData();
                 
@@ -2995,7 +3008,8 @@ namespace Oxide.Plugins
                 case "SAR":     mode = DuelMode.SAR;      break;
                 case "BOW":     mode = DuelMode.Bow;      break;
                 case "REVOLVER":mode = DuelMode.Revolver; break;
-                case "RANDOM":  mode = DuelMode.Any;      break;
+                case "RANDOM":
+                case "ANY":     mode = DuelMode.Any;      break;
                 case "SPEARGUN":
                     if (!config.EnableSpeargun)
                     {
