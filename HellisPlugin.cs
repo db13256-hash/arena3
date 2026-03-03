@@ -1354,7 +1354,7 @@ namespace Oxide.Plugins
                         queuesByType[targetQueue] = new List<ulong>();
                     if (!queuesByType[targetQueue].Contains(player1.userID))
                         queuesByType[targetQueue].Add(player1.userID);
-                    SendReply(player1, "✓ Auto-requeued for random match!");
+                    SendReply(player1, $"Auto-requeued for {GetQueueLabel(targetQueue)} match!");
                 }
                 else if (config.AutoRequeue && autoRequeueOptOut.Contains(player1.userID))
                 {
@@ -1396,7 +1396,7 @@ namespace Oxide.Plugins
                         queuesByType[targetQueue] = new List<ulong>();
                     if (!queuesByType[targetQueue].Contains(player2.userID))
                         queuesByType[targetQueue].Add(player2.userID);
-                    SendReply(player2, "✓ Auto-requeued for random match!");
+                    SendReply(player2, $"Auto-requeued for {GetQueueLabel(targetQueue)} match!");
                 }
                 else if (config.AutoRequeue && autoRequeueOptOut.Contains(player2.userID))
                 {
@@ -1699,6 +1699,18 @@ namespace Oxide.Plugins
             if (match.RoomID != null) return "Private";
             if (!match.SourceQueueType.HasValue) return "Public"; // Legacy fallback
             switch (match.SourceQueueType.Value)
+            {
+                case QueueType.PublicAK:       return "AK";
+                case QueueType.PublicBow:      return "Bow";
+                case QueueType.PublicSpeargun: return "Speargun";
+                default:                       return "Public";
+            }
+        }
+        
+        // Returns a human-readable label for a QueueType (used in chat messages).
+        private string GetQueueLabel(QueueType queueType)
+        {
+            switch (queueType)
             {
                 case QueueType.PublicAK:       return "AK";
                 case QueueType.PublicBow:      return "Bow";
@@ -3271,11 +3283,11 @@ namespace Oxide.Plugins
             }, "Hud", "LeaderboardUI");
             
             // Title showing current queue context
-            string titleText = queueKey == "Private"  ? "🏆 PRIVATE" :
-                               queueKey == "AK"       ? "🏆 PUBLIC AK47" :
-                               queueKey == "Bow"      ? "🏆 PUBLIC BOW" :
-                               queueKey == "Speargun" ? "🏆 PUBLIC SPEARGUN" :
-                                                        "🏆 PUBLIC";
+            string titleText = queueKey == "Private"  ? "PRIVATE" :
+                               queueKey == "AK"       ? "PUBLIC AK47" :
+                               queueKey == "Bow"      ? "PUBLIC BOW" :
+                               queueKey == "Speargun" ? "PUBLIC SPEARGUN" :
+                                                        "PUBLIC";
             elements.Add(new CuiLabel
             {
                 Text = { Text = titleText, FontSize = 14, Align = TextAnchor.MiddleCenter, Color = "0 0.8 0.82 1" },
