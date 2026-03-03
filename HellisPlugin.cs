@@ -62,7 +62,7 @@ namespace Oxide.Plugins
             public int CountdownDuration = 3;
             
             [JsonProperty("Best of X Rounds")]
-            public int BestOfRounds = 3;
+            public int BestOfRounds = 1;
             
             [JsonProperty("Auto Requeue After Match")]
             public bool AutoRequeue = true;
