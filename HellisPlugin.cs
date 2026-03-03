@@ -3270,22 +3270,24 @@ namespace Oxide.Plugins
             
             var elements = new CuiElementContainer();
             
-            // Main panel - top left, dark gray matching the lobby browser
+            // Main panel - top left, dark gray.
+            // AnchorMax y=0.95 (not 0.99) keeps the title 5% away from the screen top edge.
             var mainPanel = elements.Add(new CuiPanel
             {
                 Image = { Color = "0.17 0.17 0.17 0.95" },
-                RectTransform = { AnchorMin = "0.01 0.68", AnchorMax = "0.20 0.99" },
+                RectTransform = { AnchorMin = "0.01 0.64", AnchorMax = "0.20 0.95" },
                 CursorEnabled = false
             }, "Hud", "LeaderboardUI");
             
-            // Title background strip (teal tint so title area stands out)
+            // Title background strip - given a name so labels can be parented to it,
+            // ensuring they render on top (siblings in Rust CUI have undefined z-order).
             elements.Add(new CuiPanel
             {
-                Image = { Color = "0 0.8 0.82 0.2" },
-                RectTransform = { AnchorMin = "0 0.91", AnchorMax = "1 1" }
-            }, mainPanel);
+                Image = { Color = "0 0.8 0.82 0.25" },
+                RectTransform = { AnchorMin = "0 0.88", AnchorMax = "1 1" }
+            }, mainPanel, "LB.TitleBg");
             
-            // Title showing current queue context
+            // Title label - child of LB.TitleBg so it is always drawn above the background
             string titleText = queueKey == "Private"  ? "PRIVATE" :
                                queueKey == "AK"       ? "PUBLIC AK47" :
                                queueKey == "Bow"      ? "PUBLIC BOW" :
@@ -3293,22 +3295,22 @@ namespace Oxide.Plugins
                                                         "PUBLIC";
             elements.Add(new CuiLabel
             {
-                Text = { Text = titleText, FontSize = 15, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" },
-                RectTransform = { AnchorMin = "0.03 0.935", AnchorMax = "0.97 0.99" }
-            }, mainPanel);
+                Text = { Text = titleText, FontSize = 14, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" },
+                RectTransform = { AnchorMin = "0.03 0.52", AnchorMax = "0.97 1.0" }
+            }, "LB.TitleBg");
             
-            // "Last N min" sub-label confirms the time filter
+            // Sub-label "Last N min" - also a child of LB.TitleBg
             elements.Add(new CuiLabel
             {
                 Text = { Text = $"Last {config.LeaderboardTimeWindowMinutes} min", FontSize = 9, Align = TextAnchor.MiddleCenter, Color = "0.7 0.7 0.7 1" },
-                RectTransform = { AnchorMin = "0.03 0.910", AnchorMax = "0.97 0.935" }
-            }, mainPanel);
+                RectTransform = { AnchorMin = "0.03 0.05", AnchorMax = "0.97 0.52" }
+            }, "LB.TitleBg");
             
-            // Separator under title area
+            // Separator below title strip
             elements.Add(new CuiPanel
             {
-                Image = { Color = "0 0.8 0.82 0.4" },
-                RectTransform = { AnchorMin = "0.03 0.906", AnchorMax = "0.97 0.910" }
+                Image = { Color = "0 0.8 0.82 0.5" },
+                RectTransform = { AnchorMin = "0.03 0.876", AnchorMax = "0.97 0.881" }
             }, mainPanel);
             
             // ---- Leaderboard entries ----
@@ -3335,7 +3337,7 @@ namespace Oxide.Plugins
                     .ToList();
             }
             
-            float startY      = 0.900f;
+            float startY      = 0.870f;
             float entryHeight = 0.08f;
             int   rank        = 1;
             
