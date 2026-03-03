@@ -499,6 +499,10 @@ namespace Oxide.Plugins
             {
                 SendReply(player, "⚠ Lobby not configured. Admin: use /lobby setpos to set lobby location.");
             }
+            
+            // Force network re-evaluation so CanNetworkTo is applied to this player
+            // for all current lobby viewers (makes lobby players invisible to each other).
+            player.SendNetworkUpdateImmediate();
         }
         
         private object CanNetworkTo(BaseNetworkable entity, BasePlayer target)
@@ -539,6 +543,8 @@ namespace Oxide.Plugins
                 
                 // Neither player is in a match — both are in the lobby.
                 // All non-match players on this server are in the lobby, so hide them from each other.
+                // Always allow a player to see their own entity (self-visibility).
+                if (player.userID == target.userID) return null;
                 return false;
             }
             
@@ -1782,27 +1788,20 @@ namespace Oxide.Plugins
             
             var elements = new CuiElementContainer();
             
-            // Positioned between the hotbar (bottom) and player vitals — centered on screen
+            // Smaller button positioned to the right of center
             elements.Add(new CuiPanel
             {
                 Image = { Color = "0.8 0.3 0.2 0.9" }, // Orange/Red
-                RectTransform = { AnchorMin = "0.38 0.068", AnchorMax = "0.62 0.110" },
+                RectTransform = { AnchorMin = "0.65 0.072", AnchorMax = "0.78 0.108" },
                 CursorEnabled = false  // Don't capture cursor
             }, "Hud", "LeaveButton");
             
-            // Title
-            elements.Add(new CuiLabel
-            {
-                Text = { Text = "LEAVE QUEUE / MATCH", FontSize = 14, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" },
-                RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" }
-            }, "LeaveButton");
-            
-            // Clickable button
+            // Clickable button (fills panel, also carries the label)
             elements.Add(new CuiButton
             {
                 Button = { Command = "leavebutton.click", Color = "0 0 0 0" }, // Transparent overlay
                 RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" },
-                Text = { Text = "" }
+                Text = { Text = "leave", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
             }, "LeaveButton");
             
             CuiHelper.AddUi(player, elements);
@@ -2294,6 +2293,12 @@ namespace Oxide.Plugins
                 // Return both players to lobby
                 DestroyLeaveButton(player);
                 TeleportToLobby(player);
+                // Also remove forfeiting player from their private room so they can freely queue
+                var forfeiterRoomID = GetPlayerRoom(player.userID);
+                if (forfeiterRoomID != null)
+                {
+                    LeaveRoom(player, forfeiterRoomID);
+                }
                 ShowLobbyBrowser(player); // Show lobby browser instead
                 
                 if (opponent != null && opponent.IsConnected)
