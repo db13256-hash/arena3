@@ -2646,9 +2646,8 @@ namespace Oxide.Plugins
                     break;
                 case QueueType.Public:
                 default:
-                    // Random mode for public queue — include Speargun when enabled
+                    // Random mode for public queue — Speargun excluded (use dedicated Speargun queue)
                     var modeList = new List<DuelMode> { DuelMode.AK47, DuelMode.SAR, DuelMode.Bow, DuelMode.Revolver };
-                    if (config.EnableSpeargun) modeList.Add(DuelMode.Speargun);
                     mode = modeList[UnityEngine.Random.Range(0, modeList.Count)];
                     break;
             }
@@ -3302,8 +3301,8 @@ namespace Oxide.Plugins
             
             CuiHelper.AddUi(player, elements);
             
-            // Auto-dismiss after 5 seconds
-            timer.Once(5f, () => DestroyWinLoseUI(player));
+            // Auto-dismiss after 2 seconds
+            timer.Once(2f, () => DestroyWinLoseUI(player));
         }
         
         private void DestroyWinLoseUI(BasePlayer player)
