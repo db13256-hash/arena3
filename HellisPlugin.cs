@@ -1145,7 +1145,9 @@ namespace Oxide.Plugins
             GiveLoadout(player1, mode);
             GiveLoadout(player2, mode);
             
-            // Hide join button and show leave button during match
+            // Hide lobby UI and join button during match; show leave button
+            DestroyLobbyBrowser(player1);
+            DestroyLobbyBrowser(player2);
             DestroyJoinButton(player1);
             DestroyJoinButton(player2);
             ShowLeaveButton(player1);
