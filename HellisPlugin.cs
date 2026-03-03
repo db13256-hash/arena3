@@ -303,6 +303,24 @@ namespace Oxide.Plugins
                 // Check if player is in an active match
                 if (activeMatches.ContainsKey(player.userID))
                 {
+                    var match = activeMatches[player.userID];
+                    
+                    // Cross-match damage protection: block all damage from players who are NOT
+                    // this player's match opponent. This prevents physical interactions between
+                    // concurrent matches sharing the same arena spawn points.
+                    var attacker = info?.InitiatorPlayer;
+                    if (attacker != null)
+                    {
+                        bool isMatchOpponent = attacker.userID == match.Player1ID || attacker.userID == match.Player2ID;
+                        if (!isMatchOpponent)
+                        {
+                            info.damageTypes = new Rust.DamageTypeList();
+                            info.DoHitEffects = false;
+                            info.HitMaterial = 0;
+                            return true; // Block damage from outside this match
+                        }
+                    }
+                    
                     // Check if player already defeated this tick (prevents multiple headshots race condition)
                     if (defeatedThisTick.Contains(player.userID))
                     {
@@ -321,7 +339,6 @@ namespace Oxide.Plugins
                     if (player.health <= 10f || player.health - totalDamage <= 10f)
                     {
                         // Player is below/would be below 10 HP - intercept and reset!
-                        var match = activeMatches[player.userID];
                         
                         // Mark player as defeated IMMEDIATELY to prevent race conditions with rapid hits
                         defeatedThisTick.Add(player.userID);
@@ -1158,6 +1175,14 @@ namespace Oxide.Plugins
             match.SourceQueueType = sourceQueueType;
             activeMatches[player1.userID] = match;
             activeMatches[player2.userID] = match;
+            
+            // Force network re-evaluation for the two newly matched players so CanNetworkTo
+            // immediately hides them from lobby players and from players in other concurrent
+            // matches sharing the same arena. Sending the update for each player causes the
+            // server to re-check CanNetworkTo for every client, which drops visibility for
+            // clients that are no longer permitted to see these players.
+            player1.SendNetworkUpdateImmediate();
+            player2.SendNetworkUpdateImmediate();
             
             // Clean up any arrows from previous matches
             var arrows1 = new List<BaseEntity>();
