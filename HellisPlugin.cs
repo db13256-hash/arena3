@@ -1103,7 +1103,7 @@ namespace Oxide.Plugins
             ProcessAllQueues();
         }
         
-        private void StartDuel(BasePlayer player1, BasePlayer player2, DuelMode mode, string roomID = null)
+        private void StartDuel(BasePlayer player1, BasePlayer player2, DuelMode mode, string roomID = null, QueueType? sourceQueueType = null)
         {
             var arena = arenaManager.GetAvailableArena();
             if (arena == null)
@@ -1115,6 +1115,11 @@ namespace Oxide.Plugins
                     // Re-add to room waiting queue on failure
                     privateRooms[roomID].WaitingQueue.Add(player1.userID);
                     privateRooms[roomID].WaitingQueue.Add(player2.userID);
+                }
+                else if (sourceQueueType.HasValue)
+                {
+                    JoinQueueByType(player1, sourceQueueType.Value);
+                    JoinQueueByType(player2, sourceQueueType.Value);
                 }
                 else
                 {
@@ -1135,6 +1140,11 @@ namespace Oxide.Plugins
                     privateRooms[roomID].WaitingQueue.Add(player1.userID);
                     privateRooms[roomID].WaitingQueue.Add(player2.userID);
                 }
+                else if (sourceQueueType.HasValue)
+                {
+                    JoinQueueByType(player1, sourceQueueType.Value);
+                    JoinQueueByType(player2, sourceQueueType.Value);
+                }
                 else
                 {
                     queueManager.JoinQueue(player1.userID, player1.displayName, mode);
@@ -1145,6 +1155,7 @@ namespace Oxide.Plugins
             
             var match = new ActiveMatch(player1.userID, player2.userID, mode, arena, instanceId, config.BestOfRounds);
             match.RoomID = roomID;
+            match.SourceQueueType = sourceQueueType;
             activeMatches[player1.userID] = match;
             activeMatches[player2.userID] = match;
             
@@ -1310,7 +1321,11 @@ namespace Oxide.Plugins
                 }
                 else if (config.AutoRequeue && !disconnect && !autoRequeueOptOut.Contains(player1.userID))
                 {
-                    queueManager.JoinQueue(player1.userID, player1.displayName, DuelMode.Any);
+                    var targetQueue = match.SourceQueueType ?? QueueType.Public;
+                    if (!queuesByType.ContainsKey(targetQueue))
+                        queuesByType[targetQueue] = new List<ulong>();
+                    if (!queuesByType[targetQueue].Contains(player1.userID))
+                        queuesByType[targetQueue].Add(player1.userID);
                     SendReply(player1, "✓ Auto-requeued for random match!");
                 }
                 else if (config.AutoRequeue && autoRequeueOptOut.Contains(player1.userID))
@@ -1348,7 +1363,11 @@ namespace Oxide.Plugins
                 }
                 else if (config.AutoRequeue && !disconnect && !autoRequeueOptOut.Contains(player2.userID))
                 {
-                    queueManager.JoinQueue(player2.userID, player2.displayName, DuelMode.Any);
+                    var targetQueue = match.SourceQueueType ?? QueueType.Public;
+                    if (!queuesByType.ContainsKey(targetQueue))
+                        queuesByType[targetQueue] = new List<ulong>();
+                    if (!queuesByType[targetQueue].Contains(player2.userID))
+                        queuesByType[targetQueue].Add(player2.userID);
                     SendReply(player2, "✓ Auto-requeued for random match!");
                 }
                 else if (config.AutoRequeue && autoRequeueOptOut.Contains(player2.userID))
@@ -1377,6 +1396,8 @@ namespace Oxide.Plugins
                 {
                     DestroyLeaveButton(player1);
                     ShowLobbyBrowser(player1);
+                    if (GetPlayerQueueType(player1.userID).HasValue)
+                        ShowLeaveButton(player1);
                     // Show pending join requests to room owner after match
                     var ownedRoomID = GetOwnedRoom(player1.userID);
                     if (ownedRoomID != null && privateRooms.ContainsKey(ownedRoomID) &&
@@ -1389,6 +1410,8 @@ namespace Oxide.Plugins
                 {
                     DestroyLeaveButton(player2);
                     ShowLobbyBrowser(player2);
+                    if (GetPlayerQueueType(player2.userID).HasValue)
+                        ShowLeaveButton(player2);
                     var ownedRoomID = GetOwnedRoom(player2.userID);
                     if (ownedRoomID != null && privateRooms.ContainsKey(ownedRoomID) &&
                         privateRooms[ownedRoomID].PendingRequests.Count > 0)
@@ -2341,8 +2364,7 @@ namespace Oxide.Plugins
                     // Public match: auto-requeue the opponent (they didn't forfeit)
                     if (!autoRequeueOptOut.Contains(opponentID))
                     {
-                        queueManager.JoinQueue(opponentID, opponent.displayName, DuelMode.Any);
-                        SendReply(opponent, "✓ Auto-requeued for random match!");
+                        JoinQueueByType(opponent, match.SourceQueueType ?? QueueType.Public);
                     }
                     else
                     {
@@ -2723,7 +2745,7 @@ namespace Oxide.Plugins
             }
             
             // Create the match using existing StartDuel method
-            StartDuel(player1, player2, mode);
+            StartDuel(player1, player2, mode, null, queueType);
         }
         
         #endregion
@@ -4114,6 +4136,7 @@ namespace Oxide.Plugins
             public int Player2Score = 0;
             public bool RoundInProgress = false;
             public string RoomID = null; // Non-null if this match was started from a private room
+            public QueueType? SourceQueueType = null; // Non-null for Phase 3 public queue matches
             
             public ActiveMatch(ulong p1, ulong p2, DuelMode mode, Arena arena, int instanceId, int bestOf)
             {
