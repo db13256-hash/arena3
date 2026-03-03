@@ -1150,6 +1150,8 @@ namespace Oxide.Plugins
             DestroyLobbyBrowser(player2);
             DestroyJoinButton(player1);
             DestroyJoinButton(player2);
+            DestroyLeaveButton(player1);
+            DestroyLeaveButton(player2);
             ShowLeaveButton(player1);
             ShowLeaveButton(player2);
             
@@ -1340,10 +1342,10 @@ namespace Oxide.Plugins
                 timer.Once(1.5f, () => TryRoomMatchmaking(matchRoomID));
             }
             
-            // Refresh UI for both players
-            timer.Once(0.5f, () =>
+            // Refresh UI for both players — delay until after the 2 s WinLose overlay has dismissed
+            timer.Once(2.5f, () =>
             {
-                if (player1 != null && player1.IsConnected)
+                if (player1 != null && player1.IsConnected && !activeMatches.ContainsKey(player1.userID))
                 {
                     DestroyLeaveButton(player1);
                     ShowLobbyBrowser(player1);
@@ -1355,7 +1357,7 @@ namespace Oxide.Plugins
                         ShowJoinRequestUI(player1, ownedRoomID);
                     }
                 }
-                if (player2 != null && player2.IsConnected)
+                if (player2 != null && player2.IsConnected && !activeMatches.ContainsKey(player2.userID))
                 {
                     DestroyLeaveButton(player2);
                     ShowLobbyBrowser(player2);
@@ -2915,7 +2917,6 @@ namespace Oxide.Plugins
             if (duelMode == DuelMode.Any)
             {
                 var randomModes = new List<DuelMode> { DuelMode.AK47, DuelMode.SAR, DuelMode.Bow, DuelMode.Revolver };
-                if (config.EnableSpeargun) randomModes.Add(DuelMode.Speargun);
                 duelMode = randomModes[UnityEngine.Random.Range(0, randomModes.Count)];
             }
             StartDuel(p1, p2, duelMode, roomID);
@@ -3728,7 +3729,7 @@ namespace Oxide.Plugins
             
             private DuelMode GetRandomGameMode()
             {
-                // Select random mode for Any queue matches — include Speargun when enabled
+                // Select random mode for Any queue matches — Speargun excluded (use dedicated Speargun queue)
                 var availableModes = new List<DuelMode>
                 {
                     DuelMode.AK47,
@@ -3736,8 +3737,6 @@ namespace Oxide.Plugins
                     DuelMode.Bow,
                     DuelMode.Revolver
                 };
-                
-                if (enableSpeargun) availableModes.Add(DuelMode.Speargun);
                 
                 return availableModes[UnityEngine.Random.Range(0, availableModes.Count)];
             }
