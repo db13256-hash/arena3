@@ -897,15 +897,27 @@ namespace Oxide.Plugins
             SendReply(player, $"✅ Leaderboard cleared! Removed {count} player records.");
         }
         
-        // Valid loadout mode names accepted by /kit.
-        private static readonly Dictionary<string, string> KitModeNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        // Maximum character length for custom kit names.
+        private const int KitNameMaxLength = 20;
+        
+        // Abbreviated label length for kit names in compact UI buttons (CREATE ROOM row).
+        private const int KitLabelMaxLength = 5;
+        
+        // Minimum vertical anchor for the dynamically-sized gun select panel.
+        private const float GunSelectPanelMinBottom = 0.05f;
+        
+        // The 5 built-in kit names that map directly to DuelMode enum values.
+        private static readonly HashSet<string> BuiltInKitNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "AK47", "SAR", "Bow", "Revolver", "Speargun" };
+        
+        // Valid name characters for new custom kit names created with /kit save.
+        private static bool IsValidKitName(string name)
         {
-            ["AK47"]     = "AK47",
-            ["SAR"]      = "SAR",
-            ["Bow"]      = "Bow",
-            ["Revolver"] = "Revolver",
-            ["Speargun"] = "Speargun"
-        };
+            if (string.IsNullOrWhiteSpace(name) || name.Length > KitNameMaxLength) return false;
+            foreach (char c in name)
+                if (!char.IsLetterOrDigit(c) && c != '_' && c != '-') return false;
+            return true;
+        }
         
         [ChatCommand("kit")]
         private void KitCommand(BasePlayer player, string command, string[] args)
@@ -924,8 +936,9 @@ namespace Oxide.Plugins
                 SendReply(player, "/kit list             - List all kit mode names");
                 SendReply(player, "/kit show <mode>      - Show items in a kit");
                 SendReply(player, "/kit save <mode>      - Save your inventory as the kit for <mode>");
-                SendReply(player, "/kit reset <mode>     - Reset a kit to built-in defaults");
-                SendReply(player, "Valid modes: AK47, SAR, Bow, Revolver, Speargun");
+                SendReply(player, "/kit reset <mode>     - Reset a built-in kit to defaults");
+                SendReply(player, "/kit delete <mode>    - Delete a custom kit");
+                SendReply(player, "New custom names: letters/digits/underscore/dash, max 20 chars.");
                 return;
             }
             
@@ -935,7 +948,10 @@ namespace Oxide.Plugins
             {
                 case "list":
                 {
-                    SendReply(player, "Available kit modes: " + string.Join(", ", KitModeNames.Keys));
+                    if (config.Loadouts.Count == 0)
+                        SendReply(player, "No kits defined.");
+                    else
+                        SendReply(player, "Available kits: " + string.Join(", ", config.Loadouts.Keys));
                     break;
                 }
                 
@@ -946,13 +962,15 @@ namespace Oxide.Plugins
                         SendReply(player, "Usage: /kit show <mode>  (e.g. /kit show AK47)");
                         return;
                     }
-                    string modeName;
-                    if (!KitModeNames.TryGetValue(args[1], out modeName))
+                    // Case-insensitive match against config keys
+                    string modeName = config.Loadouts.Keys.FirstOrDefault(k =>
+                        string.Equals(k, args[1], StringComparison.OrdinalIgnoreCase));
+                    if (modeName == null)
                     {
-                        SendReply(player, $"Unknown mode '{args[1]}'. Valid modes: {string.Join(", ", KitModeNames.Keys)}");
+                        SendReply(player, $"Unknown kit '{args[1]}'. Use /kit list to see available kits.");
                         return;
                     }
-                    if (!config.Loadouts.ContainsKey(modeName) || config.Loadouts[modeName].Items.Count == 0)
+                    if (config.Loadouts[modeName].Items.Count == 0)
                     {
                         SendReply(player, $"Kit '{modeName}' is empty.");
                         return;
@@ -970,19 +988,22 @@ namespace Oxide.Plugins
                 {
                     if (args.Length < 2)
                     {
-                        SendReply(player, "Usage: /kit save <mode>  (e.g. /kit save AK47)");
+                        SendReply(player, "Usage: /kit save <mode>  (e.g. /kit save Shotgun)");
                         SendReply(player, "Equip yourself with the items you want, then run this command.");
                         return;
                     }
-                    string modeName;
-                    if (!KitModeNames.TryGetValue(args[1], out modeName))
+                    string inputName = args[1];
+                    if (!IsValidKitName(inputName))
                     {
-                        SendReply(player, $"Unknown mode '{args[1]}'. Valid modes: {string.Join(", ", KitModeNames.Keys)}");
+                        SendReply(player, "Invalid kit name. Use letters, digits, underscores or dashes (max 20 chars).");
                         return;
                     }
+                    // Preserve existing casing if the kit already exists, otherwise use as typed
+                    string modeName = config.Loadouts.Keys.FirstOrDefault(k =>
+                        string.Equals(k, inputName, StringComparison.OrdinalIgnoreCase)) ?? inputName;
                     
                     // Build the new loadout from the admin's current inventory
-                    // (main container + wear container, deduplicated by shortname)
+                    // (main + belt + wear containers, deduplicated by shortname)
                     var newItems = new List<LoadoutItemConfig>();
                     var seen = new Dictionary<string, int>(); // shortname -> index in newItems
                     
@@ -1021,7 +1042,7 @@ namespace Oxide.Plugins
                     loadoutManager.Reload(config);
                     
                     Puts($"{player.displayName} saved kit '{modeName}' ({newItems.Count} items)");
-                    SendReply(player, $"✅ Kit '{modeName}' saved with {newItems.Count} item(s). Use /kit show {modeName} to verify.");
+                    SendReply(player, $"✅ Kit '{modeName}' saved with {newItems.Count} item(s). It now appears in the private room mode selector.");
                     break;
                 }
                 
@@ -1030,19 +1051,15 @@ namespace Oxide.Plugins
                     if (args.Length < 2)
                     {
                         SendReply(player, "Usage: /kit reset <mode>  (e.g. /kit reset AK47)");
+                        SendReply(player, "Only the 5 built-in modes can be reset: AK47, SAR, Bow, Revolver, Speargun");
                         return;
                     }
-                    string modeName;
-                    if (!KitModeNames.TryGetValue(args[1], out modeName))
-                    {
-                        SendReply(player, $"Unknown mode '{args[1]}'. Valid modes: {string.Join(", ", KitModeNames.Keys)}");
-                        return;
-                    }
-                    
                     var defaults = Configuration.GetPublicDefaultLoadouts();
-                    if (!defaults.ContainsKey(modeName))
+                    string modeName = defaults.Keys.FirstOrDefault(k =>
+                        string.Equals(k, args[1], StringComparison.OrdinalIgnoreCase));
+                    if (modeName == null)
                     {
-                        SendReply(player, $"No built-in default exists for '{modeName}'.");
+                        SendReply(player, $"No built-in default exists for '{args[1]}'. Built-in modes: AK47, SAR, Bow, Revolver, Speargun");
                         return;
                     }
                     
@@ -1052,6 +1069,36 @@ namespace Oxide.Plugins
                     
                     Puts($"{player.displayName} reset kit '{modeName}' to defaults");
                     SendReply(player, $"✅ Kit '{modeName}' reset to built-in defaults.");
+                    break;
+                }
+                
+                case "delete":
+                {
+                    if (args.Length < 2)
+                    {
+                        SendReply(player, "Usage: /kit delete <mode>  (e.g. /kit delete Shotgun)");
+                        SendReply(player, "The 5 built-in kits cannot be deleted, only custom ones.");
+                        return;
+                    }
+                    if (BuiltInKitNames.Contains(args[1]))
+                    {
+                        SendReply(player, $"Cannot delete built-in kit '{args[1]}'. Use /kit reset to restore defaults.");
+                        return;
+                    }
+                    string modeName = config.Loadouts.Keys.FirstOrDefault(k =>
+                        string.Equals(k, args[1], StringComparison.OrdinalIgnoreCase));
+                    if (modeName == null)
+                    {
+                        SendReply(player, $"Kit '{args[1]}' does not exist.");
+                        return;
+                    }
+                    
+                    config.Loadouts.Remove(modeName);
+                    SaveConfig();
+                    loadoutManager.Reload(config);
+                    
+                    Puts($"{player.displayName} deleted kit '{modeName}'");
+                    SendReply(player, $"✅ Kit '{modeName}' deleted.");
                     break;
                 }
                 
@@ -1096,10 +1143,11 @@ namespace Oxide.Plugins
                 SendReply(player, "/lobby setpos - Set lobby position");
                 SendReply(player, "/lobby setradius <radius> - Set lobby zone radius");
                 SendReply(player, "/clearleaderboard - Clear all leaderboard data (requires confirm)");
-                SendReply(player, "/kit save <mode>      - Save your inventory as a kit (AK47/SAR/Bow/Revolver/Speargun)");
+                SendReply(player, "/kit save <mode>      - Save your inventory as a kit (any name)");
                 SendReply(player, "/kit show <mode>      - Show items in a kit");
-                SendReply(player, "/kit list             - List kit mode names");
-                SendReply(player, "/kit reset <mode>     - Reset a kit to built-in defaults");
+                SendReply(player, "/kit list             - List all kit names");
+                SendReply(player, "/kit reset <mode>     - Reset a built-in kit to defaults");
+                SendReply(player, "/kit delete <mode>    - Delete a custom kit");
                 SendReply(player, "");
             }
             
@@ -1317,7 +1365,7 @@ namespace Oxide.Plugins
             ProcessAllQueues();
         }
         
-        private void StartDuel(BasePlayer player1, BasePlayer player2, DuelMode mode, string roomID = null, QueueType? sourceQueueType = null)
+        private void StartDuel(BasePlayer player1, BasePlayer player2, DuelMode mode, string roomID = null, QueueType? sourceQueueType = null, string customModeName = null)
         {
             var arena = arenaManager.GetAvailableArena();
             if (arena == null)
@@ -1370,6 +1418,7 @@ namespace Oxide.Plugins
             var match = new ActiveMatch(player1.userID, player2.userID, mode, arena, instanceId, config.BestOfRounds);
             match.RoomID = roomID;
             match.SourceQueueType = sourceQueueType;
+            match.CustomModeName = customModeName;
             activeMatches[player1.userID] = match;
             activeMatches[player2.userID] = match;
             
@@ -1403,8 +1452,8 @@ namespace Oxide.Plugins
             TeleportPlayer(player2, arena.Spawn2);
             
             // Apply loadouts
-            GiveLoadout(player1, mode);
-            GiveLoadout(player2, mode);
+            GiveLoadout(player1, mode, customModeName);
+            GiveLoadout(player2, mode, customModeName);
             
             // Hide lobby UI and join button during match; show leave button
             DestroyLobbyBrowser(player1);
@@ -1462,20 +1511,20 @@ namespace Oxide.Plugins
                 if (player1 != null)
                 {
                     SendReply(player1, $"Round {match.CurrentRound}/{match.BestOfRounds} - Score: {match.Player1Score}-{match.Player2Score}");
-                    ResetPlayerForNextRound(player1, match.Arena.Spawn1, match.Mode);
+                    ResetPlayerForNextRound(player1, match.Arena.Spawn1, match.Mode, match.CustomModeName);
                 }
                 
                 if (player2 != null)
                 {
                     SendReply(player2, $"Round {match.CurrentRound}/{match.BestOfRounds} - Score: {match.Player1Score}-{match.Player2Score}");
-                    ResetPlayerForNextRound(player2, match.Arena.Spawn2, match.Mode);
+                    ResetPlayerForNextRound(player2, match.Arena.Spawn2, match.Mode, match.CustomModeName);
                 }
                 
                 timer.Once(config.CountdownDuration, () => StartRound(match));
             }
         }
         
-        private void ResetPlayerForNextRound(BasePlayer player, Vector3 spawnPos, DuelMode mode)
+        private void ResetPlayerForNextRound(BasePlayer player, Vector3 spawnPos, DuelMode mode, string customModeName = null)
         {
             if (player == null || !player.IsConnected) return;
             
@@ -1491,7 +1540,7 @@ namespace Oxide.Plugins
             
             // Clear and give fresh loadout
             player.inventory.Strip();
-            GiveLoadout(player, mode);
+            GiveLoadout(player, mode, customModeName);
             
             // Reset metabolism
             player.metabolism.Reset();
@@ -1743,7 +1792,7 @@ namespace Oxide.Plugins
             }
         }
         
-        private void GiveLoadout(BasePlayer player, DuelMode mode)
+        private void GiveLoadout(BasePlayer player, DuelMode mode, string customModeName = null)
         {
             if (player == null) return;
             
@@ -1752,7 +1801,9 @@ namespace Oxide.Plugins
             player.metabolism.hydration.value = 250;
             player.health = 100;
             
-            var loadout = loadoutManager.GetLoadout(mode);
+            var loadout = (mode == DuelMode.Custom && customModeName != null)
+                ? loadoutManager.GetLoadoutByName(customModeName)
+                : loadoutManager.GetLoadout(mode);
             
             // Two-pass approach: Give ammo and equipment first, then weapons
             // This ensures ammo is available when weapons auto-load
@@ -2240,7 +2291,7 @@ namespace Oxide.Plugins
                     RectTransform = { AnchorMin = $"0.03 {createLabelY}", AnchorMax = $"0.97 {createLabelY + 0.055f}" }
                 }, "LobbyBrowser");
                 
-                // One compact button per weapon mode
+                // One compact button per weapon mode — dynamically built from config
                 var createModes = new List<(string Label, string ModeArg)>
                 {
                     ("AK47", "AK47"),
@@ -2251,6 +2302,16 @@ namespace Oxide.Plugins
                 };
                 if (config.EnableSpeargun)
                     createModes.Add(("SPEAR", "SPEARGUN"));
+                // Append any custom loadout names (BuiltInKitNames covers the 5 loadout keys)
+                foreach (var key in config.Loadouts.Keys)
+                {
+                    if (!BuiltInKitNames.Contains(key))
+                    {
+                        // Truncate label to KitLabelMaxLength chars to keep buttons compact
+                        string lbl = key.Length > KitLabelMaxLength ? key.Substring(0, KitLabelMaxLength) : key;
+                        createModes.Add((lbl.ToUpper(), key));
+                    }
+                }
                 
                 int modeCount   = createModes.Count;
                 float totalW    = 0.94f;
@@ -2322,10 +2383,11 @@ namespace Oxide.Plugins
                 RectTransform = { AnchorMin = "0.05 0.50", AnchorMax = "0.55 1" }
             }, entryName);
             
-            // Mode label
+            // Mode label — show custom name when applicable
+            string modeLabel = room.CustomModeName != null ? $"[{room.CustomModeName}]" : $"[{room.Mode}]";
             elements.Add(new CuiLabel
             {
-                Text = { Text = $"[{room.Mode}]", FontSize = 10, Align = TextAnchor.MiddleLeft, Color = "0 0.8 0.82 1" },
+                Text = { Text = modeLabel, FontSize = 10, Align = TextAnchor.MiddleLeft, Color = "0 0.8 0.82 1" },
                 RectTransform = { AnchorMin = "0.05 0.05", AnchorMax = "0.45 0.50" }
             }, entryName);
             
@@ -2488,12 +2550,35 @@ namespace Oxide.Plugins
             
             CuiHelper.DestroyUi(player, "RoomGunSelect");
             
+            // Build the mode list first so we can size the panel accordingly
+            var modeList = new List<(string Label, string ModeArg)>();
+            modeList.Add(("AK47", "AK47"));
+            modeList.Add(("SAR", "SAR"));
+            modeList.Add(("Bow", "Bow"));
+            modeList.Add(("Revolver", "Revolver"));
+            modeList.Add(("Random", "Any"));
+            if (config.EnableSpeargun)
+                modeList.Add(("Speargun", "Speargun"));
+            // Custom modes: any config loadout key not in the built-in set
+            foreach (var key in config.Loadouts.Keys)
+            {
+                if (!BuiltInKitNames.Contains(key))
+                    modeList.Add((key, key));
+            }
+            
+            // Dynamically size the panel: each button 0.11 + 0.01 gap, header 0.12, close button 0.11 + margins
+            float btnH = 0.11f;
+            float gap  = 0.01f;
+            float panelContentH = 0.12f + modeList.Count * (btnH + gap) + 0.13f; // header + buttons + close
+            float panelTop    = 0.95f;
+            float panelBottom = Math.Max(GunSelectPanelMinBottom, panelTop - panelContentH);
+            
             var elements = new CuiElementContainer();
             
             elements.Add(new CuiPanel
             {
                 Image = { Color = "0.13 0.13 0.13 0.97" },
-                RectTransform = { AnchorMin = "0.38 0.30", AnchorMax = "0.62 0.78" },
+                RectTransform = { AnchorMin = $"0.38 {panelBottom:F4}", AnchorMax = $"0.62 {panelTop:F4}" },
                 CursorEnabled = false
             }, "Hud", "RoomGunSelect");
             
@@ -2503,29 +2588,20 @@ namespace Oxide.Plugins
                 RectTransform = { AnchorMin = "0 0.88", AnchorMax = "1 1" }
             }, "RoomGunSelect");
             
-            var modeList = new List<(string Label, DuelMode Mode)>
-            {
-                ("AK47", DuelMode.AK47),
-                ("SAR", DuelMode.SAR),
-                ("Bow", DuelMode.Bow),
-                ("Revolver", DuelMode.Revolver),
-                ("Random", DuelMode.Any),
-            };
-            if (config.EnableSpeargun)
-                modeList.Add(("Speargun", DuelMode.Speargun));
+            // Determine currently-active mode label for the room
+            string activeLabel = room.CustomModeName ?? (room.Mode == DuelMode.Any ? "Any" : room.Mode.ToString());
             
             float btnY = 0.84f;
-            float btnH = 0.11f;
-            float gap = 0.01f;
-            foreach (var (label, mode) in modeList)
+            foreach (var (label, modeArg) in modeList)
             {
-                bool selected = room.Mode == mode;
+                bool selected = string.Equals(activeLabel, modeArg, StringComparison.OrdinalIgnoreCase)
+                             || (modeArg == "Any" && activeLabel == "Random");
                 string btnColor = selected ? "0.1 0.55 0.1 0.95" : "0.22 0.22 0.22 0.95";
                 string checkmark = selected ? " ✓" : "";
                 
                 elements.Add(new CuiButton
                 {
-                    Button = { Command = $"lobby.roomsetmode {mode}", Color = btnColor },
+                    Button = { Command = $"lobby.roomsetmode {modeArg}", Color = btnColor },
                     RectTransform = { AnchorMin = $"0.08 {btnY - btnH:F4}", AnchorMax = $"0.92 {btnY:F4}" },
                     Text = { Text = $"{label}{checkmark}", FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
                 }, "RoomGunSelect");
@@ -2764,6 +2840,7 @@ namespace Oxide.Plugins
             var player = arg.Player();
             if (player == null) return;
             DuelMode mode = DuelMode.AK47;
+            string customName = null;
             if (arg.Args != null && arg.Args.Length > 0)
             {
                 switch (arg.Args[0].ToUpper())
@@ -2776,9 +2853,19 @@ namespace Oxide.Plugins
                     case "SPEARGUN":
                         mode = config.EnableSpeargun ? DuelMode.Speargun : DuelMode.AK47;
                         break;
+                    default:
+                        // Check for a custom loadout name (case-insensitive)
+                        var matched = config.Loadouts.Keys.FirstOrDefault(k =>
+                            string.Equals(k, arg.Args[0], StringComparison.OrdinalIgnoreCase));
+                        if (matched != null)
+                        {
+                            mode = DuelMode.Custom;
+                            customName = matched;
+                        }
+                        break;
                 }
             }
-            CreateRoom(player, mode);
+            CreateRoom(player, mode, customName);
         }
         
         // lobby.joinroom kept as alias → forwards to the request flow
@@ -3040,7 +3127,7 @@ namespace Oxide.Plugins
         
         #region Phase 4 - Private Rooms
         
-        private void CreateRoom(BasePlayer player, DuelMode mode = DuelMode.AK47)
+        private void CreateRoom(BasePlayer player, DuelMode mode = DuelMode.AK47, string customModeName = null)
         {
             if (player == null) return;
             
@@ -3090,6 +3177,7 @@ namespace Oxide.Plugins
                 PlayerIDs = new List<ulong> { player.userID },
                 WaitingQueue = new List<ulong> { player.userID },
                 Mode = mode,
+                CustomModeName = customModeName,
                 Created = DateTime.Now
             };
             
@@ -3098,7 +3186,7 @@ namespace Oxide.Plugins
             // Remove from any public queue
             LeaveQueueInternal(player, false);
             
-            string modeStr = mode == DuelMode.Any ? "Random" : mode.ToString();
+            string modeStr = customModeName ?? (mode == DuelMode.Any ? "Random" : mode.ToString());
             SendReply(player, $"Room created ({modeStr} mode)! Others can request to join from the lobby.");
             
             UpdateRoomsList();
@@ -3297,7 +3385,7 @@ namespace Oxide.Plugins
                 var randomModes = new List<DuelMode> { DuelMode.AK47, DuelMode.SAR, DuelMode.Bow, DuelMode.Revolver };
                 duelMode = randomModes[UnityEngine.Random.Range(0, randomModes.Count)];
             }
-            StartDuel(p1, p2, duelMode, roomID);
+            StartDuel(p1, p2, duelMode, roomID, null, duelMode == DuelMode.Custom ? room.CustomModeName : null);
         }
         
         private void SetRoomMode(BasePlayer player, string roomID, string modeName)
@@ -3312,6 +3400,7 @@ namespace Oxide.Plugins
             }
             
             DuelMode mode;
+            string customName = null;
             switch (modeName.ToUpper())
             {
                 case "AK47":    mode = DuelMode.AK47;     break;
@@ -3329,13 +3418,27 @@ namespace Oxide.Plugins
                     mode = DuelMode.Speargun;
                     break;
                 default:
-                    SendReply(player, "Invalid mode! Choose: AK47, SAR, Bow, Revolver, Random" +
-                              (config.EnableSpeargun ? ", Speargun" : ""));
-                    return;
+                    // Check if it matches a custom loadout name (case-insensitive)
+                    var match = config.Loadouts.Keys.FirstOrDefault(k =>
+                        string.Equals(k, modeName, StringComparison.OrdinalIgnoreCase));
+                    if (match != null)
+                    {
+                        mode = DuelMode.Custom;
+                        customName = match;
+                    }
+                    else
+                    {
+                        SendReply(player, "Invalid mode! Available modes: " +
+                            string.Join(", ", config.Loadouts.Keys));
+                        return;
+                    }
+                    break;
             }
             
             room.Mode = mode;
-            SendReply(player, $"Room weapon mode set to {mode}!");
+            room.CustomModeName = customName;
+            string displayName = customName ?? mode.ToString();
+            SendReply(player, $"Room weapon mode set to {displayName}!");
             
             // Refresh gun select UI to show updated selection
             ShowGunSelectUI(player, roomID);
@@ -4080,7 +4183,8 @@ namespace Oxide.Plugins
             Speargun,
             Bow,
             Revolver,
-            Any  // For random queue matchmaking
+            Any,    // For random queue matchmaking
+            Custom  // Admin-defined kit loaded by name from config
         }
         
         public class QueueManager
@@ -4377,6 +4481,8 @@ namespace Oxide.Plugins
         public class LoadoutManager
         {
             private Dictionary<DuelMode, Loadout> loadouts = new Dictionary<DuelMode, Loadout>();
+            // All loadouts keyed by config name, including custom modes.
+            private Dictionary<string, Loadout> namedLoadouts = new Dictionary<string, Loadout>();
             
             public LoadoutManager(Configuration config)
             {
@@ -4398,20 +4504,22 @@ namespace Oxide.Plugins
                 
                 foreach (var kvp in config.Loadouts)
                 {
+                    var loadout = new Loadout
+                    {
+                        Items = kvp.Value.Items.Select(item => new LoadoutItem
+                        {
+                            ShortName = item.ShortName,
+                            Amount = item.Amount,
+                            SkinID = item.SkinID
+                        }).ToList()
+                    };
+                    
                     if (modeMap.TryGetValue(kvp.Key, out var mode))
                     {
-                        var loadout = new Loadout
-                        {
-                            Items = kvp.Value.Items.Select(item => new LoadoutItem
-                            {
-                                ShortName = item.ShortName,
-                                Amount = item.Amount,
-                                SkinID = item.SkinID
-                            }).ToList()
-                        };
-                        
                         loadouts[mode] = loadout;
                     }
+                    // All loadout names (including custom ones) are stored in namedLoadouts.
+                    namedLoadouts[kvp.Key] = loadout;
                 }
             }
             
@@ -4420,10 +4528,17 @@ namespace Oxide.Plugins
                 return loadouts.ContainsKey(mode) ? loadouts[mode] : new Loadout();
             }
             
+            // Look up a loadout by its config key (used for custom modes).
+            public Loadout GetLoadoutByName(string name)
+            {
+                return namedLoadouts.ContainsKey(name) ? namedLoadouts[name] : new Loadout();
+            }
+            
             // Re-read loadouts from config after an in-game kit change.
             public void Reload(Configuration config)
             {
                 loadouts.Clear();
+                namedLoadouts.Clear();
                 LoadLoadoutsFromConfig(config);
             }
         }
@@ -4454,6 +4569,7 @@ namespace Oxide.Plugins
             public bool RoundInProgress = false;
             public string RoomID = null; // Non-null if this match was started from a private room
             public QueueType? SourceQueueType = null; // Non-null for Phase 3 public queue matches
+            public string CustomModeName = null; // Non-null when Mode == DuelMode.Custom
             
             public ActiveMatch(ulong p1, ulong p2, DuelMode mode, Arena arena, int instanceId, int bestOf)
             {
@@ -4586,6 +4702,7 @@ namespace Oxide.Plugins
             public List<ulong> WaitingQueue = new List<ulong>();      // Players waiting for a 1v1 match
             public Dictionary<ulong, string> PendingRequests = new Dictionary<ulong, string>(); // requesterID -> displayName
             public DuelMode Mode = DuelMode.AK47;
+            public string CustomModeName = null; // Non-null when Mode == DuelMode.Custom
             public DateTime Created;
             public bool IsOpen = true;
             

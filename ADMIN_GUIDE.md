@@ -280,7 +280,7 @@ Consider creating arenas optimized for specific modes:
 
 ## Customizing Loadouts/Kits
 
-You can fully customize what items players receive for each weapon mode. The easiest way is to use the **in-game `/kit` commands** — no JSON editing or server restart required.
+You can fully customize what items players receive for each weapon mode, and **create entirely new custom modes**. The easiest way is to use the **in-game `/kit` commands** — no JSON editing or server restart required.
 
 ### In-Game Kit Creation (Recommended)
 
@@ -292,44 +292,57 @@ You can fully customize what items players receive for each weapon mode. The eas
 2. **Equip yourself** with exactly the items you want players to receive for a mode.  
    Put weapons + ammo in your main inventory; put armor in your wear slots.
 
-3. **Save the kit** with one command:
+3. **Save the kit** with one command — use any name you like:
    ```
-   /kit save AK47
+   /kit save Shotgun
    ```
-   The plugin reads your entire inventory (main + wear) and saves it as the loadout.
-   Changes take effect immediately — no reload needed.
+   The plugin reads your entire inventory (main + belt + wear) and saves it.  
+   Changes take effect immediately — **no reload needed**.  
+   The new mode will instantly appear in the **private room mode selector** for all players.
 
 4. **Verify** what was saved:
    ```
-   /kit show AK47
+   /kit show Shotgun
    ```
 
-5. **List** all available kit names:
+5. **List** all kit names (built-in + custom):
    ```
    /kit list
    ```
 
-6. **Reset** a kit back to the built-in defaults at any time:
+6. **Reset** a built-in kit back to its defaults at any time:
    ```
    /kit reset AK47
    ```
 
-#### Example Session
-```
-# Equip: rifle.ak (x1), ammo.rifle (x120), metal.plate.torso, metal.facemask, syringe.medical (x4)
-/kit save AK47
-# ✅ Kit 'AK47' saved with 5 item(s). Use /kit show AK47 to verify.
+7. **Delete** a custom kit you no longer want:
+   ```
+   /kit delete Shotgun
+   ```
 
-/kit show AK47
-# === Kit: AK47 ===
-#   rifle.ak  x1
-#   ammo.rifle  x120
-#   metal.plate.torso  x1
-#   metal.facemask  x1
-#   syringe.medical  x4
+#### Example: Creating a Shotgun mode
+```
+# Equip: shotgun.pump (x1), ammo.shotgun (x48), metal.plate.torso, metal.facemask, syringe.medical (x3)
+/kit save Shotgun
+# ✅ Kit 'Shotgun' saved with 5 item(s). It now appears in the private room mode selector.
+
+/kit list
+# Available kits: AK47, SAR, Bow, Revolver, Speargun, Shotgun
 ```
 
-Valid mode names: **AK47**, **SAR**, **Bow**, **Revolver**, **Speargun**
+Players creating private rooms will immediately see "Shotgun" as a chooseable mode.
+
+### Kit Name Rules
+
+Custom kit names must:
+- Contain only **letters, digits, underscores (`_`) or dashes (`-`)**
+- Be **20 characters or less**
+
+### Where Custom Modes Appear
+
+- ✅ **Private room mode selector** (GUNS button in room list)  
+- ✅ **CREATE ROOM buttons** at the bottom of the lobby browser  
+- ❌ **Public queues** — custom modes are for private rooms only
 
 ### Manual Configuration (Alternative)
 
@@ -339,24 +352,21 @@ You can also directly edit `oxide/config/HellisPlugin.json` if you prefer:
 
 2. **Edit** `oxide/config/HellisPlugin.json`
 
-3. **Find the Loadouts section:**
+3. **Find the Loadouts section and add your new mode:**
    ```json
    "Loadouts": {
-     "AK47": {
+     "AK47": { ... },
+     "Shotgun": {
        "Items": [
-         { "ShortName": "rifle.ak", "Amount": 1 },
-         { "ShortName": "ammo.rifle", "Amount": 120 },
-         ...
+         { "ShortName": "shotgun.pump", "Amount": 1 },
+         { "ShortName": "ammo.shotgun", "Amount": 48 },
+         { "ShortName": "metal.plate.torso", "Amount": 1 }
        ]
      }
    }
    ```
 
-4. **Modify items** as desired
-
-5. **Save the file**
-
-6. **Reload plugin**: `oxide.reload HellisPlugin` or restart server
+4. **Reload plugin**: `oxide.reload HellisPlugin`
 
 ### Customization Examples
 
