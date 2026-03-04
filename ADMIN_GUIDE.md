@@ -280,9 +280,60 @@ Consider creating arenas optimized for specific modes:
 
 ## Customizing Loadouts/Kits
 
-You can fully customize what items players receive for each weapon mode by editing the `Loadouts` section in `oxide/config/HellisPlugin.json`.
+You can fully customize what items players receive for each weapon mode. The easiest way is to use the **in-game `/kit` commands** — no JSON editing or server restart required.
 
-### How to Customize Loadouts
+### In-Game Kit Creation (Recommended)
+
+1. **Grant yourself admin** (if not already done):
+   ```
+   oxide.grant user YourUsername hellisplugin.admin
+   ```
+
+2. **Equip yourself** with exactly the items you want players to receive for a mode.  
+   Put weapons + ammo in your main inventory; put armor in your wear slots.
+
+3. **Save the kit** with one command:
+   ```
+   /kit save AK47
+   ```
+   The plugin reads your entire inventory (main + wear) and saves it as the loadout.
+   Changes take effect immediately — no reload needed.
+
+4. **Verify** what was saved:
+   ```
+   /kit show AK47
+   ```
+
+5. **List** all available kit names:
+   ```
+   /kit list
+   ```
+
+6. **Reset** a kit back to the built-in defaults at any time:
+   ```
+   /kit reset AK47
+   ```
+
+#### Example Session
+```
+# Equip: rifle.ak (x1), ammo.rifle (x120), metal.plate.torso, metal.facemask, syringe.medical (x4)
+/kit save AK47
+# ✅ Kit 'AK47' saved with 5 item(s). Use /kit show AK47 to verify.
+
+/kit show AK47
+# === Kit: AK47 ===
+#   rifle.ak  x1
+#   ammo.rifle  x120
+#   metal.plate.torso  x1
+#   metal.facemask  x1
+#   syringe.medical  x4
+```
+
+Valid mode names: **AK47**, **SAR**, **Bow**, **Revolver**, **Speargun**
+
+### Manual Configuration (Alternative)
+
+You can also directly edit `oxide/config/HellisPlugin.json` if you prefer:
 
 1. **Stop your server** (or be ready to reload the plugin)
 

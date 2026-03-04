@@ -88,9 +88,10 @@ namespace Oxide.Plugins
             public int UIRefreshInterval = 30;
             
             [JsonProperty("Loadouts")]
-            public Dictionary<string, LoadoutConfig> Loadouts = GetDefaultLoadouts();
+            public Dictionary<string, LoadoutConfig> Loadouts = GetPublicDefaultLoadouts();
             
-            private static Dictionary<string, LoadoutConfig> GetDefaultLoadouts()
+            // Exposed so the /kit reset command can restore built-in defaults.
+            public static Dictionary<string, LoadoutConfig> GetPublicDefaultLoadouts()
             {
                 return new Dictionary<string, LoadoutConfig>
                 {
@@ -896,6 +897,170 @@ namespace Oxide.Plugins
             SendReply(player, $"✅ Leaderboard cleared! Removed {count} player records.");
         }
         
+        // Valid loadout mode names accepted by /kit.
+        private static readonly Dictionary<string, string> KitModeNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["AK47"]     = "AK47",
+            ["SAR"]      = "SAR",
+            ["Bow"]      = "Bow",
+            ["Revolver"] = "Revolver",
+            ["Speargun"] = "Speargun"
+        };
+        
+        [ChatCommand("kit")]
+        private void KitCommand(BasePlayer player, string command, string[] args)
+        {
+            if (player == null) return;
+            
+            if (!permission.UserHasPermission(player.UserIDString, "hellisplugin.admin"))
+            {
+                SendReply(player, "You must be an admin to use /kit.");
+                return;
+            }
+            
+            if (args == null || args.Length == 0)
+            {
+                SendReply(player, "Kit Commands (Admin):");
+                SendReply(player, "/kit list             - List all kit mode names");
+                SendReply(player, "/kit show <mode>      - Show items in a kit");
+                SendReply(player, "/kit save <mode>      - Save your inventory as the kit for <mode>");
+                SendReply(player, "/kit reset <mode>     - Reset a kit to built-in defaults");
+                SendReply(player, "Valid modes: AK47, SAR, Bow, Revolver, Speargun");
+                return;
+            }
+            
+            string sub = args[0].ToLower();
+            
+            switch (sub)
+            {
+                case "list":
+                {
+                    SendReply(player, "Available kit modes: " + string.Join(", ", KitModeNames.Keys));
+                    break;
+                }
+                
+                case "show":
+                {
+                    if (args.Length < 2)
+                    {
+                        SendReply(player, "Usage: /kit show <mode>  (e.g. /kit show AK47)");
+                        return;
+                    }
+                    string modeName;
+                    if (!KitModeNames.TryGetValue(args[1], out modeName))
+                    {
+                        SendReply(player, $"Unknown mode '{args[1]}'. Valid modes: {string.Join(", ", KitModeNames.Keys)}");
+                        return;
+                    }
+                    if (!config.Loadouts.ContainsKey(modeName) || config.Loadouts[modeName].Items.Count == 0)
+                    {
+                        SendReply(player, $"Kit '{modeName}' is empty.");
+                        return;
+                    }
+                    SendReply(player, $"=== Kit: {modeName} ===");
+                    foreach (var item in config.Loadouts[modeName].Items)
+                    {
+                        string skinPart = item.SkinID != 0 ? $" (skin {item.SkinID})" : "";
+                        SendReply(player, $"  {item.ShortName}  x{item.Amount}{skinPart}");
+                    }
+                    break;
+                }
+                
+                case "save":
+                {
+                    if (args.Length < 2)
+                    {
+                        SendReply(player, "Usage: /kit save <mode>  (e.g. /kit save AK47)");
+                        SendReply(player, "Equip yourself with the items you want, then run this command.");
+                        return;
+                    }
+                    string modeName;
+                    if (!KitModeNames.TryGetValue(args[1], out modeName))
+                    {
+                        SendReply(player, $"Unknown mode '{args[1]}'. Valid modes: {string.Join(", ", KitModeNames.Keys)}");
+                        return;
+                    }
+                    
+                    // Build the new loadout from the admin's current inventory
+                    // (main container + wear container, deduplicated by shortname)
+                    var newItems = new List<LoadoutItemConfig>();
+                    var seen = new Dictionary<string, int>(); // shortname -> index in newItems
+                    
+                    var allContainers = new [] { player.inventory.containerMain, player.inventory.containerBelt, player.inventory.containerWear };
+                    foreach (var container in allContainers)
+                    {
+                        foreach (Item item in container.itemList)
+                        {
+                            if (item == null) continue;
+                            string sn = item.info.shortname;
+                            if (seen.ContainsKey(sn))
+                            {
+                                newItems[seen[sn]].Amount += item.amount;
+                            }
+                            else
+                            {
+                                seen[sn] = newItems.Count;
+                                newItems.Add(new LoadoutItemConfig
+                                {
+                                    ShortName = sn,
+                                    Amount    = item.amount,
+                                    SkinID    = item.skin
+                                });
+                            }
+                        }
+                    }
+                    
+                    if (newItems.Count == 0)
+                    {
+                        SendReply(player, "Your inventory is empty. Equip the items you want in the kit first.");
+                        return;
+                    }
+                    
+                    config.Loadouts[modeName] = new LoadoutConfig { Items = newItems };
+                    SaveConfig();
+                    loadoutManager.Reload(config);
+                    
+                    Puts($"{player.displayName} saved kit '{modeName}' ({newItems.Count} items)");
+                    SendReply(player, $"✅ Kit '{modeName}' saved with {newItems.Count} item(s). Use /kit show {modeName} to verify.");
+                    break;
+                }
+                
+                case "reset":
+                {
+                    if (args.Length < 2)
+                    {
+                        SendReply(player, "Usage: /kit reset <mode>  (e.g. /kit reset AK47)");
+                        return;
+                    }
+                    string modeName;
+                    if (!KitModeNames.TryGetValue(args[1], out modeName))
+                    {
+                        SendReply(player, $"Unknown mode '{args[1]}'. Valid modes: {string.Join(", ", KitModeNames.Keys)}");
+                        return;
+                    }
+                    
+                    var defaults = Configuration.GetPublicDefaultLoadouts();
+                    if (!defaults.ContainsKey(modeName))
+                    {
+                        SendReply(player, $"No built-in default exists for '{modeName}'.");
+                        return;
+                    }
+                    
+                    config.Loadouts[modeName] = defaults[modeName];
+                    SaveConfig();
+                    loadoutManager.Reload(config);
+                    
+                    Puts($"{player.displayName} reset kit '{modeName}' to defaults");
+                    SendReply(player, $"✅ Kit '{modeName}' reset to built-in defaults.");
+                    break;
+                }
+                
+                default:
+                    SendReply(player, $"Unknown sub-command '{args[0]}'. Use /kit for help.");
+                    break;
+            }
+        }
+        
         [ChatCommand("help")]
         private void HelpCommand(BasePlayer player, string command, string[] args)
         {
@@ -931,6 +1096,10 @@ namespace Oxide.Plugins
                 SendReply(player, "/lobby setpos - Set lobby position");
                 SendReply(player, "/lobby setradius <radius> - Set lobby zone radius");
                 SendReply(player, "/clearleaderboard - Clear all leaderboard data (requires confirm)");
+                SendReply(player, "/kit save <mode>      - Save your inventory as a kit (AK47/SAR/Bow/Revolver/Speargun)");
+                SendReply(player, "/kit show <mode>      - Show items in a kit");
+                SendReply(player, "/kit list             - List kit mode names");
+                SendReply(player, "/kit reset <mode>     - Reset a kit to built-in defaults");
                 SendReply(player, "");
             }
             
@@ -4249,6 +4418,13 @@ namespace Oxide.Plugins
             public Loadout GetLoadout(DuelMode mode)
             {
                 return loadouts.ContainsKey(mode) ? loadouts[mode] : new Loadout();
+            }
+            
+            // Re-read loadouts from config after an in-game kit change.
+            public void Reload(Configuration config)
+            {
+                loadouts.Clear();
+                LoadLoadoutsFromConfig(config);
             }
         }
         
