@@ -900,9 +900,6 @@ namespace Oxide.Plugins
         // Maximum character length for custom kit names.
         private const int KitNameMaxLength = 20;
         
-        // Abbreviated label length for kit names in compact UI buttons (CREATE ROOM row).
-        private const int KitLabelMaxLength = 5;
-        
         // Minimum vertical anchor for the dynamically-sized gun select panel.
         private const float GunSelectPanelMinBottom = 0.05f;
         
@@ -2267,8 +2264,7 @@ namespace Oxide.Plugins
                 }, "LobbyBrowser");
             }
             
-            // "CREATE ROOM" mode buttons — one click creates a room with the chosen kit
-            float createLabelY  = 0.12f;
+            // CREATE ROOM button — single click creates a room; mode is chosen afterwards via the GUNS button
             float createButtonY = 0.055f;
             
             bool ownsRoom = privateRooms.Values.Any(r => r.OwnerID == player.userID);
@@ -2284,49 +2280,13 @@ namespace Oxide.Plugins
             }
             else
             {
-                // Label row
-                elements.Add(new CuiLabel
+                // Single CREATE ROOM button — mode is chosen after creation via the GUNS button
+                elements.Add(new CuiButton
                 {
-                    Text = { Text = "CREATE ROOM:", FontSize = 10, Align = TextAnchor.MiddleLeft, Color = "0.7 0.7 0.7 1" },
-                    RectTransform = { AnchorMin = $"0.03 {createLabelY}", AnchorMax = $"0.97 {createLabelY + 0.055f}" }
+                    Button = { Command = "lobby.createroom", Color = "0 0.8 0.82 0.8" },
+                    RectTransform = { AnchorMin = $"0.10 {createButtonY}", AnchorMax = $"0.90 {createButtonY + 0.06f}" },
+                    Text = { Text = "CREATE ROOM", FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
                 }, "LobbyBrowser");
-                
-                // One compact button per weapon mode — dynamically built from config
-                var createModes = new List<(string Label, string ModeArg)>
-                {
-                    ("AK47", "AK47"),
-                    ("SAR",  "SAR"),
-                    ("BOW",  "BOW"),
-                    ("REV",  "REVOLVER"),
-                    ("ANY",  "ANY"),
-                };
-                if (config.EnableSpeargun)
-                    createModes.Add(("SPEAR", "SPEARGUN"));
-                // Append any custom loadout names (BuiltInKitNames covers the 5 loadout keys)
-                foreach (var key in config.Loadouts.Keys)
-                {
-                    if (!BuiltInKitNames.Contains(key))
-                    {
-                        // Truncate label to KitLabelMaxLength chars to keep buttons compact
-                        string lbl = key.Length > KitLabelMaxLength ? key.Substring(0, KitLabelMaxLength) : key;
-                        createModes.Add((lbl.ToUpper(), key));
-                    }
-                }
-                
-                int modeCount   = createModes.Count;
-                float totalW    = 0.94f;
-                float btnW      = totalW / modeCount - 0.01f;
-                for (int i = 0; i < modeCount; i++)
-                {
-                    float x0 = 0.03f + i * (btnW + 0.01f);
-                    float x1 = x0 + btnW;
-                    elements.Add(new CuiButton
-                    {
-                        Button = { Command = $"lobby.createroom {createModes[i].ModeArg}", Color = "0 0.8 0.82 0.8" },
-                        RectTransform = { AnchorMin = $"{x0:F3} {createButtonY}", AnchorMax = $"{x1:F3} {createButtonY + 0.055f}" },
-                        Text = { Text = createModes[i].Label, FontSize = 9, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
-                    }, "LobbyBrowser");
-                }
             }
             
             CuiHelper.AddUi(player, elements);
