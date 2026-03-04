@@ -269,6 +269,10 @@ namespace Oxide.Plugins
                 timer.Repeat(config.UIRefreshInterval, 0, () => RefreshAllPlayerUI());
             }
             
+            // Periodically refresh leaderboard for players in active matches so the
+            // rolling time-window clears expired entries in real-time.
+            timer.Repeat(30f, 0, () => RefreshAllLeaderboards());
+            
             // Cleanup old stat events every 60 seconds to keep data manageable
             timer.Repeat(60f, 0, () => CleanupOldEvents());
             
@@ -2043,21 +2047,57 @@ namespace Oxide.Plugins
                 }, "LobbyBrowser");
             }
             
-            // "CREATE ROOM +" button — auto-names the room after the player's username
-            float createButtonY = 0.05f;
+            // "CREATE ROOM" mode buttons — one click creates a room with the chosen kit
+            float createLabelY  = 0.12f;
+            float createButtonY = 0.055f;
             
-            // Show CREATE ROOM button only if viewer doesn't already own a room
             bool ownsRoom = privateRooms.Values.Any(r => r.OwnerID == player.userID);
-            string createBtnText = ownsRoom ? "YOU HAVE A ROOM" : "CREATE ROOM +";
-            string createBtnColor = ownsRoom ? "0.3 0.3 0.3 0.6" : "0 0.8 0.82 0.8";
-            string createBtnCmd = ownsRoom ? "" : "lobby.createroom";
-            
-            elements.Add(new CuiButton
+            if (ownsRoom)
             {
-                Button = { Command = createBtnCmd, Color = createBtnColor },
-                RectTransform = { AnchorMin = $"0.10 {createButtonY}", AnchorMax = $"0.90 {createButtonY + 0.06f}" },
-                Text = { Text = createBtnText, FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
-            }, "LobbyBrowser");
+                // Player already has a room — show disabled state
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = "", Color = "0.3 0.3 0.3 0.6" },
+                    RectTransform = { AnchorMin = $"0.10 {createButtonY}", AnchorMax = $"0.90 {createButtonY + 0.06f}" },
+                    Text = { Text = "YOU HAVE A ROOM", FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                }, "LobbyBrowser");
+            }
+            else
+            {
+                // Label row
+                elements.Add(new CuiLabel
+                {
+                    Text = { Text = "CREATE ROOM:", FontSize = 10, Align = TextAnchor.MiddleLeft, Color = "0.7 0.7 0.7 1" },
+                    RectTransform = { AnchorMin = $"0.03 {createLabelY}", AnchorMax = $"0.97 {createLabelY + 0.055f}" }
+                }, "LobbyBrowser");
+                
+                // One compact button per weapon mode
+                var createModes = new List<(string Label, string ModeArg)>
+                {
+                    ("AK47", "AK47"),
+                    ("SAR",  "SAR"),
+                    ("BOW",  "BOW"),
+                    ("REV",  "REVOLVER"),
+                    ("ANY",  "ANY"),
+                };
+                if (config.EnableSpeargun)
+                    createModes.Add(("SPEAR", "SPEARGUN"));
+                
+                int modeCount   = createModes.Count;
+                float totalW    = 0.94f;
+                float btnW      = totalW / modeCount - 0.01f;
+                for (int i = 0; i < modeCount; i++)
+                {
+                    float x0 = 0.03f + i * (btnW + 0.01f);
+                    float x1 = x0 + btnW;
+                    elements.Add(new CuiButton
+                    {
+                        Button = { Command = $"lobby.createroom {createModes[i].ModeArg}", Color = "0 0.8 0.82 0.8" },
+                        RectTransform = { AnchorMin = $"{x0:F3} {createButtonY}", AnchorMax = $"{x1:F3} {createButtonY + 0.055f}" },
+                        Text = { Text = createModes[i].Label, FontSize = 9, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                    }, "LobbyBrowser");
+                }
+            }
             
             CuiHelper.AddUi(player, elements);
         }
@@ -2554,8 +2594,22 @@ namespace Oxide.Plugins
         {
             var player = arg.Player();
             if (player == null) return;
-            // Room is auto-named after the player — no arguments needed
-            CreateRoom(player);
+            DuelMode mode = DuelMode.AK47;
+            if (arg.Args != null && arg.Args.Length > 0)
+            {
+                switch (arg.Args[0].ToUpper())
+                {
+                    case "AK47":     mode = DuelMode.AK47;     break;
+                    case "SAR":      mode = DuelMode.SAR;      break;
+                    case "BOW":      mode = DuelMode.Bow;      break;
+                    case "REVOLVER": mode = DuelMode.Revolver; break;
+                    case "ANY":      mode = DuelMode.Any;      break;
+                    case "SPEARGUN":
+                        mode = config.EnableSpeargun ? DuelMode.Speargun : DuelMode.AK47;
+                        break;
+                }
+            }
+            CreateRoom(player, mode);
         }
         
         // lobby.joinroom kept as alias → forwards to the request flow
@@ -2817,7 +2871,7 @@ namespace Oxide.Plugins
         
         #region Phase 4 - Private Rooms
         
-        private void CreateRoom(BasePlayer player)
+        private void CreateRoom(BasePlayer player, DuelMode mode = DuelMode.AK47)
         {
             if (player == null) return;
             
@@ -2857,7 +2911,7 @@ namespace Oxide.Plugins
                 return;
             }
             
-            // Room is named after the creator's display name
+            // Room is named after the creator's display name, mode set at creation time
             var room = new PrivateRoom
             {
                 RoomID = roomID,
@@ -2866,7 +2920,7 @@ namespace Oxide.Plugins
                 OwnerName = player.displayName,
                 PlayerIDs = new List<ulong> { player.userID },
                 WaitingQueue = new List<ulong> { player.userID },
-                Mode = DuelMode.AK47,
+                Mode = mode,
                 Created = DateTime.Now
             };
             
@@ -2875,8 +2929,8 @@ namespace Oxide.Plugins
             // Remove from any public queue
             LeaveQueueInternal(player, false);
             
-            SendReply(player, $"Room created! Others can request to join from the lobby.");
-            SendReply(player, "Use the GUNS button to choose a weapon mode.");
+            string modeStr = mode == DuelMode.Any ? "Random" : mode.ToString();
+            SendReply(player, $"Room created ({modeStr} mode)! Others can request to join from the lobby.");
             
             UpdateRoomsList();
         }
@@ -3301,11 +3355,11 @@ namespace Oxide.Plugins
             
             var elements = new CuiElementContainer();
             
-            // Main panel - top left, dark gray.
+            // Main panel - anchored to the true top-left corner, tall enough for 10 entries + footer.
             var mainPanel = elements.Add(new CuiPanel
             {
                 Image = { Color = "0.17 0.17 0.17 0.95" },
-                RectTransform = { AnchorMin = "0.01 0.68", AnchorMax = "0.20 0.99" },
+                RectTransform = { AnchorMin = "0.01 0.60", AnchorMax = "0.20 1.0" },
                 CursorEnabled = false
             }, "Hud", "LeaderboardUI");
             
@@ -3370,8 +3424,8 @@ namespace Oxide.Plugins
                     .ToList();
             }
             
-            float startY      = 0.830f;
-            float entryHeight = 0.08f;
+            float startY      = 0.825f;
+            float entryHeight = 0.075f;
             int   rank        = 1;
             
             if (topPlayers.Count == 0)
