@@ -3282,13 +3282,15 @@ namespace Oxide.Plugins
             
             // Title background strip - named so labels can be parented to it,
             // ensuring they always render above the background panel.
+            // Strip occupies top 16% of panel (~40 px at 812 p screen) so both labels
+            // have enough height: font-size must be ≤ ~70% of the box height to render.
             elements.Add(new CuiPanel
             {
                 Image = { Color = "0 0.8 0.82 0.25" },
-                RectTransform = { AnchorMin = "0 0.88", AnchorMax = "1 1" }
+                RectTransform = { AnchorMin = "0 0.84", AnchorMax = "1 1" }
             }, mainPanel, "LB.TitleBg");
             
-            // Title label - child of LB.TitleBg; inset from parent edges (never touches y=1.0)
+            // Title label - queue name, upper 49% of strip (~20 px), font 13 = 65% of box ✓
             string titleText = queueKey == "Private"  ? "PRIVATE" :
                                queueKey == "AK"       ? "PUBLIC AK47" :
                                queueKey == "Bow"      ? "PUBLIC BOW" :
@@ -3296,22 +3298,22 @@ namespace Oxide.Plugins
                                                         "PUBLIC";
             elements.Add(new CuiLabel
             {
-                Text = { Text = titleText, FontSize = 14, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" },
+                Text = { Text = titleText, FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" },
                 RectTransform = { AnchorMin = "0.03 0.48", AnchorMax = "0.97 0.97" }
             }, "LB.TitleBg");
             
-            // Sub-label "Last N min" - child of LB.TitleBg
+            // Sub-label "Last N min" - lower 45% of strip (~18 px), font 9 = 50% of box ✓
             elements.Add(new CuiLabel
             {
                 Text = { Text = $"Last {config.LeaderboardTimeWindowMinutes} min", FontSize = 9, Align = TextAnchor.MiddleCenter, Color = "0.7 0.7 0.7 1" },
                 RectTransform = { AnchorMin = "0.03 0.03", AnchorMax = "0.97 0.48" }
             }, "LB.TitleBg");
             
-            // Separator below title strip
+            // Separator sits just below the strip bottom (strip AnchorMin y=0.84 in panel)
             elements.Add(new CuiPanel
             {
                 Image = { Color = "0 0.8 0.82 0.5" },
-                RectTransform = { AnchorMin = "0.03 0.876", AnchorMax = "0.97 0.881" }
+                RectTransform = { AnchorMin = "0.03 0.836", AnchorMax = "0.97 0.841" }
             }, mainPanel);
             
             // ---- Leaderboard entries ----
@@ -3338,7 +3340,7 @@ namespace Oxide.Plugins
                     .ToList();
             }
             
-            float startY      = 0.870f;
+            float startY      = 0.830f;
             float entryHeight = 0.08f;
             int   rank        = 1;
             
