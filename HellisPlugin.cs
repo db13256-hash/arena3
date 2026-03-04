@@ -784,6 +784,35 @@ namespace Oxide.Plugins
             return data.StatEvents.Count(e => e.Type == "Loss" && e.Timestamp >= cutoff);
         }
         
+        private int GetRecentWinsByQueue(PlayerData data, string queueKey, int minutes)
+        {
+            var cutoff = DateTime.Now.AddMinutes(-minutes);
+            return data.StatEvents.Count(e => e.Type == "Win" && e.QueueKey == queueKey && e.Timestamp >= cutoff);
+        }
+        
+        private int GetRecentLossesByQueue(PlayerData data, string queueKey, int minutes)
+        {
+            var cutoff = DateTime.Now.AddMinutes(-minutes);
+            return data.StatEvents.Count(e => e.Type == "Loss" && e.QueueKey == queueKey && e.Timestamp >= cutoff);
+        }
+        
+        // Single-pass helper: returns win-rate percentage (0-100) for recent matches in queueKey.
+        // Used in both sort lambdas and display to avoid iterating StatEvents twice per comparison.
+        private float GetRecentWinRateByQueue(PlayerData data, string queueKey, int minutes)
+        {
+            var cutoff = DateTime.Now.AddMinutes(-minutes);
+            int wins = 0, losses = 0;
+            foreach (var e in data.StatEvents)
+            {
+                if (e.QueueKey == queueKey && e.Timestamp >= cutoff)
+                {
+                    if (e.Type == "Win")       wins++;
+                    else if (e.Type == "Loss") losses++;
+                }
+            }
+            return (wins + losses > 0) ? (100f * wins / (wins + losses)) : 0f;
+        }
+        
         // Cleanup old stat events to prevent data bloat
         private void CleanupOldEvents()
         {
@@ -1635,19 +1664,21 @@ namespace Oxide.Plugins
             data.TotalMatches++;
             data.LastMatchTime = DateTime.Now; // Update timestamp for leaderboard filtering
             
+            // Determine queue key before recording stat events so it can be stored per-event
+            string queueKey = GetMatchQueueKey(match);
+            
             if (won)
             {
                 data.Wins++;
-                data.StatEvents.Add(new StatEvent { Type = "Win", Timestamp = DateTime.Now });
+                data.StatEvents.Add(new StatEvent { Type = "Win", Timestamp = DateTime.Now, QueueKey = queueKey });
             }
             else
             {
                 data.Losses++;
-                data.StatEvents.Add(new StatEvent { Type = "Loss", Timestamp = DateTime.Now });
+                data.StatEvents.Add(new StatEvent { Type = "Loss", Timestamp = DateTime.Now, QueueKey = queueKey });
             }
             
-            // Record per-queue win/loss
-            string queueKey = GetMatchQueueKey(match);
+            // Record per-queue win/loss (cumulative, kept for compatibility)
             var queueDict = won ? data.WinsByQueue : data.LossesByQueue;
             if (!queueDict.ContainsKey(queueKey)) queueDict[queueKey] = 0;
             queueDict[queueKey]++;
@@ -3271,12 +3302,10 @@ namespace Oxide.Plugins
             var elements = new CuiElementContainer();
             
             // Main panel - top left, dark gray.
-            // AnchorMax y=0.84 keeps the entire title area 16% below the screen top edge,
-            // well clear of Rust's HUD safe-area clip boundary.
             var mainPanel = elements.Add(new CuiPanel
             {
                 Image = { Color = "0.17 0.17 0.17 0.95" },
-                RectTransform = { AnchorMin = "0.01 0.53", AnchorMax = "0.20 0.84" },
+                RectTransform = { AnchorMin = "0.01 0.68", AnchorMax = "0.20 0.99" },
                 CursorEnabled = false
             }, "Hud", "LeaderboardUI");
             
@@ -3322,20 +3351,21 @@ namespace Oxide.Plugins
             List<KeyValuePair<ulong, PlayerData>> topPlayers;
             if (queueKey == "Private" && otherPlayerID != 0)
             {
-                // Private match: only show this match's two participants
+                // Private match: only show this match's two participants, sorted by recent wins
                 topPlayers = playerData
                     .Where(p => p.Key == player.userID || p.Key == otherPlayerID)
-                    .OrderByDescending(p => p.Value.WinsByQueue.ContainsKey("Private") ? p.Value.WinsByQueue["Private"] : 0)
-                    .ThenByDescending(p => GetQueueWinRate(p.Value, "Private"))
+                    .OrderByDescending(p => GetRecentWinsByQueue(p.Value, "Private", config.LeaderboardTimeWindowMinutes))
+                    .ThenByDescending(p => GetRecentWinRateByQueue(p.Value, "Private", config.LeaderboardTimeWindowMinutes))
                     .ToList();
             }
             else
             {
                 topPlayers = playerData
-                    .Where(p => (p.Value.WinsByQueue.ContainsKey(queueKey) || p.Value.LossesByQueue.ContainsKey(queueKey))
-                                && p.Value.LastMatchTime >= cutoffTime)
-                    .OrderByDescending(p => p.Value.WinsByQueue.ContainsKey(queueKey) ? p.Value.WinsByQueue[queueKey] : 0)
-                    .ThenByDescending(p => GetQueueWinRate(p.Value, queueKey))
+                    .Where(p => p.Value.StatEvents.Any(e => (e.Type == "Win" || e.Type == "Loss")
+                                                         && e.QueueKey == queueKey
+                                                         && e.Timestamp >= cutoffTime))
+                    .OrderByDescending(p => GetRecentWinsByQueue(p.Value, queueKey, config.LeaderboardTimeWindowMinutes))
+                    .ThenByDescending(p => GetRecentWinRateByQueue(p.Value, queueKey, config.LeaderboardTimeWindowMinutes))
                     .Take(10)
                     .ToList();
             }
@@ -3359,9 +3389,9 @@ namespace Oxide.Plugins
                 var   playerName = covalence.Players.FindPlayerById(entry.Key.ToString())?.Name ?? "Unknown";
                 if (playerName.Length > 12) playerName = playerName.Substring(0, 12);
                 
-                int   w    = entry.Value.WinsByQueue.ContainsKey(queueKey)   ? entry.Value.WinsByQueue[queueKey]   : 0;
-                int   l    = entry.Value.LossesByQueue.ContainsKey(queueKey) ? entry.Value.LossesByQueue[queueKey] : 0;
-                float wr   = GetQueueWinRate(entry.Value, queueKey);
+                int   w    = GetRecentWinsByQueue(entry.Value, queueKey, config.LeaderboardTimeWindowMinutes);
+                int   l    = GetRecentLossesByQueue(entry.Value, queueKey, config.LeaderboardTimeWindowMinutes);
+                float wr   = GetRecentWinRateByQueue(entry.Value, queueKey, config.LeaderboardTimeWindowMinutes);
                 string txt = $"{rank}. {playerName}  {w}W-{l}L ({wr:F0}%)";
                 
                 string textColor = entry.Key == player.userID ? "1 1 0 1" : "0.9 0.9 0.9 1";
@@ -3381,22 +3411,23 @@ namespace Oxide.Plugins
             if (queueKey != "Private" && playerData.ContainsKey(player.userID))
             {
                 var yourData = playerData[player.userID];
-                int yourW = yourData.WinsByQueue.ContainsKey(queueKey)   ? yourData.WinsByQueue[queueKey]   : 0;
-                int yourL = yourData.LossesByQueue.ContainsKey(queueKey) ? yourData.LossesByQueue[queueKey] : 0;
+                int yourW = GetRecentWinsByQueue(yourData, queueKey, config.LeaderboardTimeWindowMinutes);
+                int yourL = GetRecentLossesByQueue(yourData, queueKey, config.LeaderboardTimeWindowMinutes);
                 
                 if (yourW > 0 || yourL > 0)
                 {
                     int yourRank = playerData
-                        .Where(p => (p.Value.WinsByQueue.ContainsKey(queueKey) || p.Value.LossesByQueue.ContainsKey(queueKey))
-                                    && p.Value.LastMatchTime >= cutoffTime)
-                        .OrderByDescending(p => p.Value.WinsByQueue.ContainsKey(queueKey) ? p.Value.WinsByQueue[queueKey] : 0)
-                        .ThenByDescending(p => GetQueueWinRate(p.Value, queueKey))
+                        .Where(p => p.Value.StatEvents.Any(e => (e.Type == "Win" || e.Type == "Loss")
+                                                             && e.QueueKey == queueKey
+                                                             && e.Timestamp >= cutoffTime))
+                        .OrderByDescending(p => GetRecentWinsByQueue(p.Value, queueKey, config.LeaderboardTimeWindowMinutes))
+                        .ThenByDescending(p => GetRecentWinRateByQueue(p.Value, queueKey, config.LeaderboardTimeWindowMinutes))
                         .ToList()
                         .FindIndex(p => p.Key == player.userID) + 1;
                     
                     if (yourRank > 10)
                     {
-                        float yourWr = GetQueueWinRate(yourData, queueKey);
+                        float yourWr = GetRecentWinRateByQueue(yourData, queueKey, config.LeaderboardTimeWindowMinutes);
                         elements.Add(new CuiLabel
                         {
                             Text = { Text = $"Your rank: #{yourRank}  {yourW}W-{yourL}L ({yourWr:F0}%)",
@@ -4255,6 +4286,9 @@ namespace Oxide.Plugins
             
             [JsonProperty("Timestamp")]
             public DateTime Timestamp;
+            
+            [JsonProperty("QueueKey")]
+            public string QueueKey = "";  // empty string for legacy events without queue context
         }
         
         public class PlayerData
