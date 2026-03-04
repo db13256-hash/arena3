@@ -31,6 +31,8 @@ namespace Oxide.Plugins
         private List<ArenaConfig> arenas = new List<ArenaConfig>(); // Arena storage (stored in data file, not config)
         // Lobby browser system
         private Dictionary<QueueType, List<ulong>> queuesByType = new Dictionary<QueueType, List<ulong>>();
+        // Public queues for custom kits: kit name -> list of queued player IDs
+        private Dictionary<string, List<ulong>> customQueuesByName = new Dictionary<string, List<ulong>>(StringComparer.OrdinalIgnoreCase);
         private Dictionary<string, PrivateRoom> privateRooms = new Dictionary<string, PrivateRoom>();
         
         #endregion
@@ -242,6 +244,13 @@ namespace Oxide.Plugins
             foreach (QueueType queueType in Enum.GetValues(typeof(QueueType)))
             {
                 queuesByType[queueType] = new List<ulong>();
+            }
+            
+            // Initialize public queues for custom kits
+            foreach (var key in config.Loadouts.Keys)
+            {
+                if (!BuiltInKitNames.Contains(key))
+                    customQueuesByName[key] = new List<ulong>();
             }
             
             // Migration: Move lobby from old config to arena data (one-time)
@@ -596,7 +605,7 @@ namespace Oxide.Plugins
             bool leftOldQueue = queueManager.LeaveQueue(player.userID);
 
             // Try to leave Phase 3 queue system
-            bool inNewQueue = GetPlayerQueueType(player.userID).HasValue;
+            bool inNewQueue = GetPlayerQueueType(player.userID).HasValue || GetPlayerCustomQueue(player.userID) != null;
             LeaveQueueInternal(player, false);
 
             if (leftOldQueue || inNewQueue)
@@ -751,7 +760,7 @@ namespace Oxide.Plugins
                 ShowLobbyBrowser(player); // Show lobby browser instead of old button
                 
                 // Restore leave button for players waiting in a Phase 3 queue
-                if (GetPlayerQueueType(player.userID).HasValue || queueManager.IsQueued(player.userID))
+                if (GetPlayerQueueType(player.userID).HasValue || GetPlayerCustomQueue(player.userID) != null || queueManager.IsQueued(player.userID))
                 {
                     ShowLeaveButton(player);
                 }
@@ -1380,6 +1389,11 @@ namespace Oxide.Plugins
                     JoinQueueByType(player1, sourceQueueType.Value);
                     JoinQueueByType(player2, sourceQueueType.Value);
                 }
+                else if (mode == DuelMode.Custom && customModeName != null && customQueuesByName.ContainsKey(customModeName))
+                {
+                    JoinCustomQueue(player1, customModeName);
+                    JoinCustomQueue(player2, customModeName);
+                }
                 else
                 {
                     queueManager.JoinQueue(player1.userID, player1.displayName, mode);
@@ -1403,6 +1417,11 @@ namespace Oxide.Plugins
                 {
                     JoinQueueByType(player1, sourceQueueType.Value);
                     JoinQueueByType(player2, sourceQueueType.Value);
+                }
+                else if (mode == DuelMode.Custom && customModeName != null && customQueuesByName.ContainsKey(customModeName))
+                {
+                    JoinCustomQueue(player1, customModeName);
+                    JoinCustomQueue(player2, customModeName);
                 }
                 else
                 {
@@ -1593,12 +1612,22 @@ namespace Oxide.Plugins
                 }
                 else if (config.AutoRequeue && !disconnect && !autoRequeueOptOut.Contains(player1.userID))
                 {
-                    var targetQueue = match.SourceQueueType ?? QueueType.Public;
-                    if (!queuesByType.ContainsKey(targetQueue))
-                        queuesByType[targetQueue] = new List<ulong>();
-                    if (!queuesByType[targetQueue].Contains(player1.userID))
-                        queuesByType[targetQueue].Add(player1.userID);
-                    SendReply(player1, $"Auto-requeued for {GetQueueLabel(targetQueue)} match!");
+                    if (IsCustomPublicQueueMatch(match))
+                    {
+                        // Custom public-queue match — re-add to custom queue
+                        if (customQueuesByName.ContainsKey(match.CustomModeName) && !customQueuesByName[match.CustomModeName].Contains(player1.userID))
+                            customQueuesByName[match.CustomModeName].Add(player1.userID);
+                        SendReply(player1, $"Auto-requeued for {match.CustomModeName} match!");
+                    }
+                    else
+                    {
+                        var targetQueue = match.SourceQueueType ?? QueueType.Public;
+                        if (!queuesByType.ContainsKey(targetQueue))
+                            queuesByType[targetQueue] = new List<ulong>();
+                        if (!queuesByType[targetQueue].Contains(player1.userID))
+                            queuesByType[targetQueue].Add(player1.userID);
+                        SendReply(player1, $"Auto-requeued for {GetQueueLabel(targetQueue)} match!");
+                    }
                 }
                 else if (config.AutoRequeue && autoRequeueOptOut.Contains(player1.userID))
                 {
@@ -1635,12 +1664,21 @@ namespace Oxide.Plugins
                 }
                 else if (config.AutoRequeue && !disconnect && !autoRequeueOptOut.Contains(player2.userID))
                 {
-                    var targetQueue = match.SourceQueueType ?? QueueType.Public;
-                    if (!queuesByType.ContainsKey(targetQueue))
-                        queuesByType[targetQueue] = new List<ulong>();
-                    if (!queuesByType[targetQueue].Contains(player2.userID))
-                        queuesByType[targetQueue].Add(player2.userID);
-                    SendReply(player2, $"Auto-requeued for {GetQueueLabel(targetQueue)} match!");
+                    if (IsCustomPublicQueueMatch(match))
+                    {
+                        if (customQueuesByName.ContainsKey(match.CustomModeName) && !customQueuesByName[match.CustomModeName].Contains(player2.userID))
+                            customQueuesByName[match.CustomModeName].Add(player2.userID);
+                        SendReply(player2, $"Auto-requeued for {match.CustomModeName} match!");
+                    }
+                    else
+                    {
+                        var targetQueue = match.SourceQueueType ?? QueueType.Public;
+                        if (!queuesByType.ContainsKey(targetQueue))
+                            queuesByType[targetQueue] = new List<ulong>();
+                        if (!queuesByType[targetQueue].Contains(player2.userID))
+                            queuesByType[targetQueue].Add(player2.userID);
+                        SendReply(player2, $"Auto-requeued for {GetQueueLabel(targetQueue)} match!");
+                    }
                 }
                 else if (config.AutoRequeue && autoRequeueOptOut.Contains(player2.userID))
                 {
@@ -1945,6 +1983,9 @@ namespace Oxide.Plugins
         private string GetMatchQueueKey(ActiveMatch match)
         {
             if (match.RoomID != null) return "Private";
+            // Custom public-queue match (no SourceQueueType, but has a custom kit name)
+            if (match.Mode == DuelMode.Custom && match.CustomModeName != null && !match.SourceQueueType.HasValue)
+                return match.CustomModeName;
             if (!match.SourceQueueType.HasValue) return "Public"; // Legacy fallback
             switch (match.SourceQueueType.Value)
             {
@@ -1954,6 +1995,14 @@ namespace Oxide.Plugins
                 default:                       return "Public";
             }
         }
+        
+        // Returns true when a match was started from a custom public-queue (not a private room,
+        // not a built-in typed queue) and is therefore associated with customQueuesByName.
+        private bool IsCustomPublicQueueMatch(ActiveMatch match) =>
+            match.RoomID == null &&
+            match.Mode == DuelMode.Custom &&
+            match.CustomModeName != null &&
+            !match.SourceQueueType.HasValue;
         
         // Returns a human-readable label for a QueueType (used in chat messages).
         private string GetQueueLabel(QueueType queueType)
@@ -2224,6 +2273,14 @@ namespace Oxide.Plugins
                 queueY -= 0.08f;
                 int spearCount = queuesByType.ContainsKey(QueueType.PublicSpeargun) ? queuesByType[QueueType.PublicSpeargun].Count : 0;
                 AddQueueEntry(elements, "LobbyBrowser", "Speargun", $"({spearCount} Players)", queueY, "joinqueue.spear");
+            }
+            
+            // Public custom-kit queues (one row per custom loadout in config)
+            foreach (var kvp in customQueuesByName)
+            {
+                queueY -= 0.08f;
+                int customCount = kvp.Value.Count;
+                AddQueueEntry(elements, "LobbyBrowser", kvp.Key, $"({customCount} Players)", queueY, $"joinqueue.custom {kvp.Key}");
             }
             
             // ========== PRIVATE ROOMS SECTION ==========
@@ -2695,7 +2752,10 @@ namespace Oxide.Plugins
                     // Public match: auto-requeue the opponent (they didn't forfeit)
                     if (!autoRequeueOptOut.Contains(opponentID))
                     {
-                        JoinQueueByType(opponent, match.SourceQueueType ?? QueueType.Public);
+                        if (IsCustomPublicQueueMatch(match))
+                            JoinCustomQueue(opponent, match.CustomModeName);
+                        else
+                            JoinQueueByType(opponent, match.SourceQueueType ?? QueueType.Public);
                     }
                     else
                     {
@@ -2798,6 +2858,28 @@ namespace Oxide.Plugins
             }
             
             JoinQueueByType(player, QueueType.PublicSpeargun);
+        }
+        
+        [ConsoleCommand("joinqueue.custom")]
+        private void JoinQueueCustomCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+            
+            if (arg.Args == null || arg.Args.Length < 1)
+            {
+                SendReply(player, "Usage: joinqueue.custom <kitName>");
+                return;
+            }
+            
+            string kitName = arg.Args[0];
+            if (!customQueuesByName.ContainsKey(kitName))
+            {
+                SendReply(player, $"Unknown custom kit: {kitName}");
+                return;
+            }
+            
+            JoinCustomQueue(player, kitName);
         }
         
         [ConsoleCommand("lobby.createroom")]
@@ -2973,6 +3055,11 @@ namespace Oxide.Plugins
                 // Remove from current queue
                 LeaveQueueInternal(player, false);
             }
+            else if (GetPlayerCustomQueue(player.userID) != null)
+            {
+                // Was in a custom queue — leave it
+                LeaveQueueInternal(player, false);
+            }
             
             // Add to specified queue
             if (!queuesByType.ContainsKey(queueType))
@@ -2998,6 +3085,15 @@ namespace Oxide.Plugins
             
             bool wasInQueue = false;
             foreach (var queue in queuesByType.Values)
+            {
+                if (queue.Remove(player.userID))
+                {
+                    wasInQueue = true;
+                }
+            }
+            
+            // Also remove from custom kit queues
+            foreach (var queue in customQueuesByName.Values)
             {
                 if (queue.Remove(player.userID))
                 {
@@ -3035,6 +3131,12 @@ namespace Oxide.Plugins
             foreach (QueueType queueType in Enum.GetValues(typeof(QueueType)))
             {
                 TryMatchPlayersInQueue(queueType);
+            }
+            
+            // Process custom-kit public queues
+            foreach (var kitName in customQueuesByName.Keys)
+            {
+                TryMatchCustomQueue(kitName);
             }
         }
         
@@ -3087,6 +3189,82 @@ namespace Oxide.Plugins
             
             // Create the match using existing StartDuel method
             StartDuel(player1, player2, mode, null, queueType);
+        }
+        
+        private void JoinCustomQueue(BasePlayer player, string kitName)
+        {
+            if (player == null) return;
+            
+            // Block if player is inside a private room
+            if (GetPlayerRoom(player.userID) != null)
+            {
+                SendReply(player, "You must leave your private room before joining a public queue!");
+                return;
+            }
+            
+            // Check if player is already in a match
+            if (activeMatches.Values.Any(d => d.Player1ID == player.userID || d.Player2ID == player.userID))
+            {
+                SendReply(player, "You're already in a match!");
+                return;
+            }
+            
+            // Check if already in this custom queue
+            string currentCustom = GetPlayerCustomQueue(player.userID);
+            if (currentCustom != null)
+            {
+                if (string.Equals(currentCustom, kitName, StringComparison.OrdinalIgnoreCase))
+                {
+                    SendReply(player, "You're already in this queue!");
+                    return;
+                }
+                LeaveQueueInternal(player, false);
+            }
+            else if (GetPlayerQueueType(player.userID).HasValue)
+            {
+                // In a regular typed queue — leave it first
+                LeaveQueueInternal(player, false);
+            }
+            
+            customQueuesByName[kitName].Add(player.userID);
+            SendReply(player, $"Joined {kitName} queue! Waiting for opponent...");
+            ShowLobbyBrowser(player);
+            ShowLeaveButton(player);
+        }
+        
+        private string GetPlayerCustomQueue(ulong playerID)
+        {
+            foreach (var kvp in customQueuesByName)
+            {
+                if (kvp.Value.Contains(playerID))
+                    return kvp.Key;
+            }
+            return null;
+        }
+        
+        private void TryMatchCustomQueue(string kitName)
+        {
+            if (!customQueuesByName.ContainsKey(kitName)) return;
+            var queue = customQueuesByName[kitName];
+            if (queue.Count < 2) return;
+            
+            var player1ID = queue[0];
+            var player2ID = queue[1];
+            var player1 = BasePlayer.FindByID(player1ID);
+            var player2 = BasePlayer.FindByID(player2ID);
+            
+            if (player1 == null || player2 == null)
+            {
+                if (player1 == null) queue.Remove(player1ID);
+                if (player2 == null) queue.Remove(player2ID);
+                return;
+            }
+            
+            queue.RemoveAt(0);
+            queue.RemoveAt(0);
+            
+            // Start the duel as a Custom-mode match with the kit name
+            StartDuel(player1, player2, DuelMode.Custom, null, null, kitName);
         }
         
         #endregion
