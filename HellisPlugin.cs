@@ -3271,23 +3271,24 @@ namespace Oxide.Plugins
             var elements = new CuiElementContainer();
             
             // Main panel - top left, dark gray.
-            // AnchorMax y=0.95 (not 0.99) keeps the title 5% away from the screen top edge.
+            // AnchorMax y=0.84 keeps the entire title area 16% below the screen top edge,
+            // well clear of Rust's HUD safe-area clip boundary.
             var mainPanel = elements.Add(new CuiPanel
             {
                 Image = { Color = "0.17 0.17 0.17 0.95" },
-                RectTransform = { AnchorMin = "0.01 0.64", AnchorMax = "0.20 0.95" },
+                RectTransform = { AnchorMin = "0.01 0.53", AnchorMax = "0.20 0.84" },
                 CursorEnabled = false
             }, "Hud", "LeaderboardUI");
             
-            // Title background strip - given a name so labels can be parented to it,
-            // ensuring they render on top (siblings in Rust CUI have undefined z-order).
+            // Title background strip - named so labels can be parented to it,
+            // ensuring they always render above the background panel.
             elements.Add(new CuiPanel
             {
                 Image = { Color = "0 0.8 0.82 0.25" },
                 RectTransform = { AnchorMin = "0 0.88", AnchorMax = "1 1" }
             }, mainPanel, "LB.TitleBg");
             
-            // Title label - child of LB.TitleBg so it is always drawn above the background
+            // Title label - child of LB.TitleBg; inset from parent edges (never touches y=1.0)
             string titleText = queueKey == "Private"  ? "PRIVATE" :
                                queueKey == "AK"       ? "PUBLIC AK47" :
                                queueKey == "Bow"      ? "PUBLIC BOW" :
@@ -3296,14 +3297,14 @@ namespace Oxide.Plugins
             elements.Add(new CuiLabel
             {
                 Text = { Text = titleText, FontSize = 14, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" },
-                RectTransform = { AnchorMin = "0.03 0.52", AnchorMax = "0.97 1.0" }
+                RectTransform = { AnchorMin = "0.03 0.48", AnchorMax = "0.97 0.97" }
             }, "LB.TitleBg");
             
-            // Sub-label "Last N min" - also a child of LB.TitleBg
+            // Sub-label "Last N min" - child of LB.TitleBg
             elements.Add(new CuiLabel
             {
                 Text = { Text = $"Last {config.LeaderboardTimeWindowMinutes} min", FontSize = 9, Align = TextAnchor.MiddleCenter, Color = "0.7 0.7 0.7 1" },
-                RectTransform = { AnchorMin = "0.03 0.05", AnchorMax = "0.97 0.52" }
+                RectTransform = { AnchorMin = "0.03 0.03", AnchorMax = "0.97 0.48" }
             }, "LB.TitleBg");
             
             // Separator below title strip
