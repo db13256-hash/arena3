@@ -2526,10 +2526,16 @@ namespace Oxide.Plugins
                     modeList.Add((key, key));
             }
             
-            // Dynamically size the panel: each button 0.11 + 0.01 gap, header 0.12, close button 0.11 + margins
-            float btnH = 0.11f;
-            float gap  = 0.01f;
-            float panelContentH = 0.12f + modeList.Count * (btnH + gap) + 0.13f; // header + buttons + close
+            // Dynamically size the panel: each button up to 0.11 + 0.01 gap, header 0.12, close button 0.10 + margins
+            float gap       = 0.01f;
+            float closeBtnH = 0.10f;
+            // Scale button height down when there are many modes so everything fits within the panel.
+            // Available relative height for buttons = btnStartY(0.84) - closeBtnH - 2*gap
+            float btnH = modeList.Count > 0
+                ? Math.Min(0.11f, (0.84f - closeBtnH - 2f * gap) / modeList.Count - gap)
+                : 0.11f;
+            int   btnFontSize  = btnH >= 0.095f ? 13 : (btnH >= 0.075f ? 11 : 10);
+            float panelContentH = 0.12f + modeList.Count * (btnH + gap) + closeBtnH + 0.03f; // header + buttons + close
             float panelTop    = 0.95f;
             float panelBottom = Math.Max(GunSelectPanelMinBottom, panelTop - panelContentH);
             
@@ -2563,7 +2569,7 @@ namespace Oxide.Plugins
                 {
                     Button = { Command = $"lobby.roomsetmode {modeArg}", Color = btnColor },
                     RectTransform = { AnchorMin = $"0.08 {btnY - btnH:F4}", AnchorMax = $"0.92 {btnY:F4}" },
-                    Text = { Text = $"{label}{checkmark}", FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                    Text = { Text = $"{label}{checkmark}", FontSize = btnFontSize, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
                 }, "RoomGunSelect");
                 
                 btnY -= btnH + gap;
@@ -2571,7 +2577,7 @@ namespace Oxide.Plugins
             
             // CLOSE button — position dynamically below last mode button so it never overlaps
             float closeBtnMax = btnY - gap;
-            float closeBtnMin = closeBtnMax - 0.10f;
+            float closeBtnMin = closeBtnMax - closeBtnH;
             elements.Add(new CuiButton
             {
                 Button = { Command = "lobby.closeguns", Color = "0.55 0.1 0.1 0.9" },
