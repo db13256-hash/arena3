@@ -198,6 +198,10 @@ namespace Oxide.Plugins
             public Vector3 LobbyPosition;
             public float LobbyRadius = 10f;
             public bool LobbyPositionSet;
+            
+            // When set, every match played in this arena uses this kit regardless of mode.
+            // Null means use the global kit for the chosen mode.
+            public string KitOverride = null;
         }
         
         protected override void LoadConfig()
@@ -1146,6 +1150,8 @@ namespace Oxide.Plugins
                 SendReply(player, "/arena list - List all arenas");
                 SendReply(player, "/arena delete <name> - Delete arena");
                 SendReply(player, "/arena setradius <name> <radius> - Set arena zone radius");
+                SendReply(player, "/arena setkit <name> <kitName> - Override kit for an arena");
+                SendReply(player, "/arena clearkit <name> - Remove per-arena kit override");
                 SendReply(player, "/lobby setpos - Set lobby position");
                 SendReply(player, "/lobby setradius <radius> - Set lobby zone radius");
                 SendReply(player, "/clearleaderboard - Clear all leaderboard data (requires confirm)");
@@ -1249,6 +1255,8 @@ namespace Oxide.Plugins
                                  "/arena list - List all arenas\n" +
                                  "/arena delete <name> - Delete an arena\n" +
                                  "/arena setradius <name> <radius> - Set arena zone radius\n" +
+                                 "/arena setkit <name> <kitName> - Override kit for this arena\n" +
+                                 "/arena clearkit <name> - Remove per-arena kit override\n" +
                                  "/arena tp <name> [1|2] - Teleport to arena spawn");
                 return;
             }
@@ -1341,6 +1349,64 @@ namespace Oxide.Plugins
                     SaveArenas();
                     SendReply(player, $"Arena '{arenaNameForRadius}' radius set to: {arenaRadius}m");
                     break;
+                    
+                case "setkit":
+                {
+                    if (args.Length < 3)
+                    {
+                        SendReply(player, "Usage: /arena setkit <arenaName> <kitName>");
+                        return;
+                    }
+                    // Last arg is the kit name; args[1] through args[Length-2] form the arena name.
+                    string kitName = args[args.Length - 1];
+                    string arenaNameForKit = string.Join(" ", args.Skip(1).Take(args.Length - 2));
+                    
+                    // Validate kit exists
+                    string resolvedKit = config.Loadouts.Keys.FirstOrDefault(k =>
+                        string.Equals(k, kitName, StringComparison.OrdinalIgnoreCase));
+                    if (resolvedKit == null)
+                    {
+                        SendReply(player, $"Unknown kit '{kitName}'. Use /kit list to see available kits.");
+                        return;
+                    }
+                    
+                    // Update ArenaConfig (data file) and live Arena object
+                    var arenaConfigForKit = arenas.FirstOrDefault(a =>
+                        a.Name.Equals(arenaNameForKit, StringComparison.OrdinalIgnoreCase));
+                    if (arenaConfigForKit == null)
+                    {
+                        SendReply(player, $"Arena '{arenaNameForKit}' not found.");
+                        return;
+                    }
+                    arenaConfigForKit.KitOverride = resolvedKit;
+                    SaveArenas();
+                    // Update the live Arena object so active matches can see the change
+                    arenaManager.SetArenaKitOverride(arenaNameForKit, resolvedKit);
+                    SendReply(player, $"Arena '{arenaConfigForKit.Name}' will now use kit '{resolvedKit}' for every match.");
+                    break;
+                }
+                    
+                case "clearkit":
+                {
+                    if (args.Length < 2)
+                    {
+                        SendReply(player, "Usage: /arena clearkit <arenaName>");
+                        return;
+                    }
+                    string arenaNameToClear = string.Join(" ", args.Skip(1));
+                    var arenaConfigToClear = arenas.FirstOrDefault(a =>
+                        a.Name.Equals(arenaNameToClear, StringComparison.OrdinalIgnoreCase));
+                    if (arenaConfigToClear == null)
+                    {
+                        SendReply(player, $"Arena '{arenaNameToClear}' not found.");
+                        return;
+                    }
+                    arenaConfigToClear.KitOverride = null;
+                    SaveArenas();
+                    arenaManager.SetArenaKitOverride(arenaNameToClear, null);
+                    SendReply(player, $"Arena '{arenaConfigToClear.Name}' kit override cleared (uses mode-based kit).");
+                    break;
+                }
                     
                 default:
                     SendReply(player, "Unknown command. Use /arena for help.");
@@ -1468,8 +1534,8 @@ namespace Oxide.Plugins
             TeleportPlayer(player2, arena.Spawn2);
             
             // Apply loadouts
-            GiveLoadout(player1, mode, customModeName);
-            GiveLoadout(player2, mode, customModeName);
+            GiveLoadout(player1, mode, customModeName, arena.KitOverride);
+            GiveLoadout(player2, mode, customModeName, arena.KitOverride);
             
             // Hide lobby UI and join button during match; show leave button
             DestroyLobbyBrowser(player1);
@@ -1527,20 +1593,20 @@ namespace Oxide.Plugins
                 if (player1 != null)
                 {
                     SendReply(player1, $"Round {match.CurrentRound}/{match.BestOfRounds} - Score: {match.Player1Score}-{match.Player2Score}");
-                    ResetPlayerForNextRound(player1, match.Arena.Spawn1, match.Mode, match.CustomModeName);
+                    ResetPlayerForNextRound(player1, match.Arena.Spawn1, match.Mode, match.CustomModeName, match.Arena.KitOverride);
                 }
                 
                 if (player2 != null)
                 {
                     SendReply(player2, $"Round {match.CurrentRound}/{match.BestOfRounds} - Score: {match.Player1Score}-{match.Player2Score}");
-                    ResetPlayerForNextRound(player2, match.Arena.Spawn2, match.Mode, match.CustomModeName);
+                    ResetPlayerForNextRound(player2, match.Arena.Spawn2, match.Mode, match.CustomModeName, match.Arena.KitOverride);
                 }
                 
                 timer.Once(config.CountdownDuration, () => StartRound(match));
             }
         }
         
-        private void ResetPlayerForNextRound(BasePlayer player, Vector3 spawnPos, DuelMode mode, string customModeName = null)
+        private void ResetPlayerForNextRound(BasePlayer player, Vector3 spawnPos, DuelMode mode, string customModeName = null, string arenaKitOverride = null)
         {
             if (player == null || !player.IsConnected) return;
             
@@ -1556,7 +1622,7 @@ namespace Oxide.Plugins
             
             // Clear and give fresh loadout
             player.inventory.Strip();
-            GiveLoadout(player, mode, customModeName);
+            GiveLoadout(player, mode, customModeName, arenaKitOverride);
             
             // Reset metabolism
             player.metabolism.Reset();
@@ -1827,7 +1893,7 @@ namespace Oxide.Plugins
             }
         }
         
-        private void GiveLoadout(BasePlayer player, DuelMode mode, string customModeName = null)
+        private void GiveLoadout(BasePlayer player, DuelMode mode, string customModeName = null, string arenaKitOverride = null)
         {
             if (player == null) return;
             
@@ -1836,9 +1902,14 @@ namespace Oxide.Plugins
             player.metabolism.hydration.value = 250;
             player.health = 100;
             
-            var loadout = (mode == DuelMode.Custom && customModeName != null)
-                ? loadoutManager.GetLoadoutByName(customModeName)
-                : loadoutManager.GetLoadout(mode);
+            // Priority: arena kit override > custom mode name > mode-based loadout
+            Loadout loadout;
+            if (arenaKitOverride != null)
+                loadout = loadoutManager.GetLoadoutByName(arenaKitOverride);
+            else if (mode == DuelMode.Custom && customModeName != null)
+                loadout = loadoutManager.GetLoadoutByName(customModeName);
+            else
+                loadout = loadoutManager.GetLoadout(mode);
             
             // Two-pass approach: Give ammo and equipment first, then weapons
             // This ensures ammo is available when weapons auto-load
@@ -4121,6 +4192,8 @@ namespace Oxide.Plugins
                 message += $"  Spawn 1: {arena.Spawn1}\n";
                 message += $"  Spawn 2: {arena.Spawn2}\n";
                 message += $"  Zone Radius: {radius}m\n";
+                if (arena.KitOverride != null)
+                    message += $"  Kit Override: {arena.KitOverride}\n";
                 
                 if (activeInstances > 0)
                 {
@@ -4482,7 +4555,8 @@ namespace Oxide.Plugins
                         MaxInstances = maxInstances,
                         LobbyPosition = config.LobbyPosition,
                         LobbyRadius = config.LobbyRadius,
-                        LobbyPositionSet = config.LobbyPositionSet
+                        LobbyPositionSet = config.LobbyPositionSet,
+                        KitOverride = config.KitOverride
                     });
                 }
             }
@@ -4527,13 +4601,23 @@ namespace Oxide.Plugins
                     MaxInstances = maxInstancesPerArena,
                     LobbyPosition = config.LobbyPosition,
                     LobbyRadius = config.LobbyRadius,
-                    LobbyPositionSet = config.LobbyPositionSet
+                    LobbyPositionSet = config.LobbyPositionSet,
+                    KitOverride = config.KitOverride
                 });
             }
             
             public void RemoveArena(string name)
             {
                 arenas.RemoveAll(a => a.Name == name);
+            }
+            
+            // Update the kit override on a live Arena object (called when an admin uses /arena setkit or /arena clearkit).
+            public void SetArenaKitOverride(string arenaName, string kitOverride)
+            {
+                var arena = arenas.FirstOrDefault(a =>
+                    a.Name.Equals(arenaName, StringComparison.OrdinalIgnoreCase));
+                if (arena != null)
+                    arena.KitOverride = kitOverride;
             }
             
             public bool ArenaExists(string name)
@@ -4586,6 +4670,9 @@ namespace Oxide.Plugins
             public Vector3 LobbyPosition;
             public float LobbyRadius = 10f;
             public bool LobbyPositionSet;
+            
+            // When non-null, every match in this arena uses this kit name (overrides mode-based kit).
+            public string KitOverride = null;
             
             public Arena()
             {
