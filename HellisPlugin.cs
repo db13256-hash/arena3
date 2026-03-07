@@ -1252,11 +1252,12 @@ namespace Oxide.Plugins
                                  "/arena create <name> - Start creating a new arena\n" +
                                  "/arena setspawn1 - Set first spawn point\n" +
                                  "/arena setspawn2 - Set second spawn point\n" +
+                                 "/arena setradius <radius> - Set zone radius during creation (default: 30m)\n" +
                                  "/arena save - Save the arena\n" +
                                  "/arena cancel - Cancel arena creation\n" +
                                  "/arena list - List all arenas\n" +
                                  "/arena delete <name> - Delete an arena\n" +
-                                 "/arena setradius <name> <radius> - Set arena zone radius\n" +
+                                 "/arena setradius <name> <radius> - Change radius of a saved arena\n" +
                                  "/arena setkit <name> <kitName> - Set arena kit (replaces pool)\n" +
                                  "/arena addkit <name> <kitName> - Add kit to random pool\n" +
                                  "/arena removekit <name> <kitName> - Remove kit from pool\n" +
@@ -1327,9 +1328,29 @@ namespace Oxide.Plugins
                     break;
                     
                 case "setradius":
+                    // During an active creation session: /arena setradius <radius>
+                    if (args.Length == 2 && arenaBuilders.ContainsKey(player.userID))
+                    {
+                        float newRadius;
+                        if (!float.TryParse(args[1], out newRadius) || newRadius <= 0)
+                        {
+                            SendReply(player, "Invalid radius. Please enter a positive number.");
+                            return;
+                        }
+                        var builderForRadius = arenaBuilders[player.userID];
+                        builderForRadius.Radius = newRadius;
+                        SendReply(player, $"Arena radius set to {newRadius}m. Zone preview updated.");
+                        // Restart visualization to immediately reflect the new radius
+                        if (builderForRadius.Spawn1 != Vector3.zero)
+                            StartBuilderVisualization(player, builderForRadius);
+                        return;
+                    }
+                    
+                    // Saved arena: /arena setradius <name> <radius>
                     if (args.Length < 3)
                     {
-                        SendReply(player, "Usage: /arena setradius <name> <radius>");
+                        SendReply(player, "Usage: /arena setradius <radius>  (during creation)\n" +
+                                         "       /arena setradius <name> <radius>  (saved arena)");
                         return;
                     }
                     
@@ -4156,7 +4177,8 @@ namespace Oxide.Plugins
             SendReply(player, $"Creating arena '{name}'.\n" +
                              "Step 1: Move to the first spawn point and use /arena setspawn1\n" +
                              "Step 2: Move to the second spawn point and use /arena setspawn2\n" +
-                             "Step 3: Use /arena save to save the arena");
+                             "Step 3: (Optional) Use /arena setradius <radius> to adjust the zone size (default: 30m)\n" +
+                             "Step 4: Use /arena save to save the arena");
         }
         
         private void SetSpawn1(BasePlayer player)
@@ -4219,7 +4241,8 @@ namespace Oxide.Plugins
             {
                 Name = builder.Name,
                 Spawn1 = builder.Spawn1,
-                Spawn2 = builder.Spawn2
+                Spawn2 = builder.Spawn2,
+                Radius = builder.Radius
             };
             
             // Add to arena list
@@ -4287,13 +4310,13 @@ namespace Oxide.Plugins
             }
             
             // Draw the zone as a sphere centred at the midpoint between the two spawns
-            // (or at spawn1 alone if spawn2 isn't set yet), using the default arena radius.
+            // (or at spawn1 alone if spawn2 isn't set yet), using the builder's current radius.
             if (builder.Spawn1 != Vector3.zero)
             {
                 Vector3 center = builder.Spawn2 != Vector3.zero
                     ? (builder.Spawn1 + builder.Spawn2) * 0.5f
                     : builder.Spawn1;
-                float radius = 30f; // Default arena radius
+                float radius = builder.Radius;
                 player.SendConsoleCommand("ddraw.sphere",
                     VisualizationDuration, zoneColor, center, radius);
                 player.SendConsoleCommand("ddraw.text",
@@ -5098,6 +5121,7 @@ namespace Oxide.Plugins
             public string Name;
             public Vector3 Spawn1 = Vector3.zero;
             public Vector3 Spawn2 = Vector3.zero;
+            public float Radius = 30f;
             // Repeating timer that refreshes ddraw visuals for this builder session.
             public Oxide.Core.Libraries.Timer VisualizationTimer;
         }
