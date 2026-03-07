@@ -5123,7 +5123,7 @@ namespace Oxide.Plugins
             public Vector3 Spawn2 = Vector3.zero;
             public float Radius = 30f;
             // Repeating timer that refreshes ddraw visuals for this builder session.
-            public Oxide.Core.Libraries.Timer VisualizationTimer;
+            public Oxide.Plugins.Timer VisualizationTimer;
         }
         
         // Queue types for lobby browser
