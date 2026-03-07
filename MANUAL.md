@@ -67,8 +67,9 @@ The lobby supports **multiple spawn points**. When a player is sent to the lobby
 |---------|-------------|
 | `/lobby setpos` | Set (or replace) spawn point 1 at your current position |
 | `/lobby addspawn` | Add an additional spawn point at your current position |
+| `/lobby editspawn <n>` | Move spawn point `n` to your current position (update in-place) |
 | `/lobby removespawn <n>` | Remove spawn point number `n` (see `/lobby listspawns`) |
-| `/lobby listspawns` | List all spawn points with their coordinates |
+| `/lobby listspawns` | List all spawn points with DDraw markers shown in-world |
 | `/lobby setradius <r>` | Set the lobby zone radius in metres (default: 10 m) |
 
 #### Example — setting up three lobby spawns
@@ -293,8 +294,9 @@ oxide.grant user YourName hellisplugin.admin
 |---------|-------------|
 | `/lobby setpos` | Set (replace) lobby spawn 1 at your position |
 | `/lobby addspawn` | Add a lobby spawn at your position |
+| `/lobby editspawn <n>` | Move lobby spawn `n` to your current position |
 | `/lobby removespawn <n>` | Remove lobby spawn number `n` |
-| `/lobby listspawns` | List all lobby spawns |
+| `/lobby listspawns` | List all lobby spawns (shows DDraw markers) |
 | `/lobby setradius <r>` | Set lobby zone radius (metres) |
 | `/arena create <name>` | Start creating a new arena |
 | `/arena edit <name>` | Edit an existing arena |

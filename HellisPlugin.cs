@@ -1246,6 +1246,30 @@ namespace Oxide.Plugins
                             sb.AppendLine($"  {i + 1}: {spawnPoints[i]}");
                         sb.AppendLine($"Zone radius: {arenaManager.GetLobbyRadius()}m");
                         SendReply(player, sb.ToString().TrimEnd());
+                        ShowLobbySpawnVisuals(player);
+                    }
+                    break;
+                    
+                case "editspawn":
+                    if (args.Length < 2)
+                    {
+                        SendReply(player, $"Usage: /lobby editspawn <number>\nUse /lobby listspawns to see spawn numbers.");
+                        return;
+                    }
+                    int editIndex;
+                    int editTotal = arenaManager.GetLobbySpawnPoints().Count;
+                    if (int.TryParse(args[1], out editIndex) && editIndex >= 1 && editIndex <= editTotal)
+                    {
+                        arenaManager.EditLobbySpawn(editIndex - 1, player.transform.position);
+                        SaveLobbyData();
+                        SendReply(player, $"Lobby spawn point {editIndex} updated to: {player.transform.position}");
+                        ShowLobbySpawnVisuals(player);
+                    }
+                    else
+                    {
+                        SendReply(player, editTotal == 0
+                            ? "No spawn points set yet. Use /lobby setpos or /lobby addspawn first."
+                            : $"Invalid number. Must be 1–{editTotal}. Use /lobby listspawns to see them.");
                     }
                     break;
                     
@@ -1274,8 +1298,9 @@ namespace Oxide.Plugins
                                      "/lobby - Teleport to lobby\n" +
                                      "/lobby setpos - Set (or replace) spawn point 1\n" +
                                      "/lobby addspawn - Add another spawn point at your position\n" +
+                                     "/lobby editspawn <n> - Move spawn point n to your position\n" +
                                      "/lobby removespawn <n> - Remove spawn point by number\n" +
-                                     "/lobby listspawns - List all spawn points\n" +
+                                     "/lobby listspawns - List all spawn points (shows DDraw markers)\n" +
                                      "/lobby setradius <radius> - Set lobby zone radius (Admin)");
                     break;
             }
@@ -4471,6 +4496,7 @@ namespace Oxide.Plugins
         // Duration is set to just over the refresh interval so visuals never flicker out.
         private const float VisualizationRefreshInterval = 3f;
         private const float VisualizationDuration = 3.5f;
+        private const float SpawnMarkerRadius = 0.5f; // DDraw sphere radius for spawn point markers
         
         private void DrawArenaBuilderVisuals(BasePlayer player, ArenaBuilder builder)
         {
@@ -4485,7 +4511,7 @@ namespace Oxide.Plugins
             {
                 // Small sphere at spawn 1 with an elevated text label
                 player.SendConsoleCommand("ddraw.sphere",
-                    VisualizationDuration, spawn1Color, builder.Spawn1, 0.5f);
+                    VisualizationDuration, spawn1Color, builder.Spawn1, SpawnMarkerRadius);
                 player.SendConsoleCommand("ddraw.text",
                     VisualizationDuration, spawn1Color,
                     builder.Spawn1 + Vector3.up * 2f,
@@ -4496,7 +4522,7 @@ namespace Oxide.Plugins
             {
                 // Small sphere at spawn 2 with an elevated text label
                 player.SendConsoleCommand("ddraw.sphere",
-                    VisualizationDuration, spawn2Color, builder.Spawn2, 0.5f);
+                    VisualizationDuration, spawn2Color, builder.Spawn2, SpawnMarkerRadius);
                 player.SendConsoleCommand("ddraw.text",
                     VisualizationDuration, spawn2Color,
                     builder.Spawn2 + Vector3.up * 2f,
@@ -4507,7 +4533,7 @@ namespace Oxide.Plugins
             if (builder.LobbySpawn != Vector3.zero)
             {
                 player.SendConsoleCommand("ddraw.sphere",
-                    VisualizationDuration, lobbyColor, builder.LobbySpawn, 0.5f);
+                    VisualizationDuration, lobbyColor, builder.LobbySpawn, SpawnMarkerRadius);
                 player.SendConsoleCommand("ddraw.sphere",
                     VisualizationDuration, lobbyColor, builder.LobbySpawn, builder.LobbyRadius);
                 player.SendConsoleCommand("ddraw.text",
@@ -4560,6 +4586,37 @@ namespace Oxide.Plugins
                 builder.VisualizationTimer.Destroy();
                 builder.VisualizationTimer = null;
             }
+        }
+        
+        // Draw DDraw markers for all global lobby spawn points so admins can see them in-world.
+        private void DrawLobbySpawnVisuals(BasePlayer player)
+        {
+            if (player == null || !player.IsConnected) return;
+            var spawns = arenaManager.GetLobbySpawnPoints();
+            float radius = arenaManager.GetLobbyRadius();
+            Color spawnColor = new Color(1f, 0.85f, 0f);   // gold
+            Color zoneColor  = new Color(1f, 0.85f, 0f, 0.35f);
+            for (int i = 0; i < spawns.Count; i++)
+            {
+                Vector3 pos = spawns[i];
+                player.SendConsoleCommand("ddraw.sphere", VisualizationDuration, spawnColor, pos, SpawnMarkerRadius);
+                player.SendConsoleCommand("ddraw.sphere", VisualizationDuration, zoneColor, pos, radius);
+                player.SendConsoleCommand("ddraw.text", VisualizationDuration, spawnColor,
+                    pos + Vector3.up * (radius + 1f),
+                    $"<size=18>LOBBY SPAWN {i + 1}\n{pos}</size>");
+            }
+        }
+        
+        // Show lobby spawn visuals once and repeat for a few seconds so the admin can see them.
+        private void ShowLobbySpawnVisuals(BasePlayer player)
+        {
+            DrawLobbySpawnVisuals(player);
+            // Repeat once after the initial draw so the admin has time to look around
+            timer.Once(VisualizationRefreshInterval, () =>
+            {
+                if (player != null && player.IsConnected)
+                    DrawLobbySpawnVisuals(player);
+            });
         }
         
         private void ListArenas(BasePlayer player)
@@ -5123,6 +5180,14 @@ namespace Oxide.Plugins
             {
                 lobbySpawnPoints = points != null ? new List<Vector3>(points) : new List<Vector3>();
                 lobbyRadius = radius;
+            }
+            
+            // Replace an existing spawn point in-place; returns false if index is out of range
+            public bool EditLobbySpawn(int index, Vector3 position)
+            {
+                if (index < 0 || index >= lobbySpawnPoints.Count) return false;
+                lobbySpawnPoints[index] = position;
+                return true;
             }
         }
         
