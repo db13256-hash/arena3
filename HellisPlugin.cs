@@ -543,48 +543,40 @@ namespace Oxide.Plugins
         
         private object CanNetworkTo(BaseNetworkable entity, BasePlayer target)
         {
-            // Player visibility isolation for multi-instance arenas
-            // Players in a match can only see their opponent
-            if (entity is BasePlayer player)
+            // Determine which player "owns" the entity being networked.
+            // We treat both BasePlayer entities and HeldEntity items with the same
+            // visibility rules, so lobby players and their held items are all hidden.
+            BasePlayer subjectPlayer = entity as BasePlayer;
+            if (subjectPlayer == null && entity is HeldEntity heldEntity)
+                subjectPlayer = heldEntity.GetOwnerPlayer();
+            
+            // Not a player-owned entity — leave default networking behaviour.
+            if (subjectPlayer == null) return null;
+            
+            // If the subject player is in an active match, only their match opponent
+            // (and themselves) should see them.
+            if (activeMatches.ContainsKey(subjectPlayer.userID))
             {
-                // Check if the player is in an active match
-                if (activeMatches.ContainsKey(player.userID))
-                {
-                    var match = activeMatches[player.userID];
-                    
-                    // Allow visibility to opponent in the same match
-                    if (target.userID == match.Player1ID || target.userID == match.Player2ID)
-                    {
-                        return null; // Allow default behavior (visible)
-                    }
-                    
-                    // Hide from all other players
-                    return false;
-                }
-                
-                // Check if the target is in an active match
-                if (activeMatches.ContainsKey(target.userID))
-                {
-                    var match = activeMatches[target.userID];
-                    
-                    // Only show to their opponent
-                    if (player.userID == match.Player1ID || player.userID == match.Player2ID)
-                    {
-                        return null; // Allow default behavior (visible)
-                    }
-                    
-                    // Hide from all other players
-                    return false;
-                }
-                
-                // Neither player is in a match — both are in the lobby.
-                // All non-match players on this server are in the lobby, so hide them from each other.
-                // Always allow a player to see their own entity (self-visibility).
-                if (player.userID == target.userID) return null;
-                return false;
+                var match = activeMatches[subjectPlayer.userID];
+                if (target.userID == match.Player1ID || target.userID == match.Player2ID)
+                    return null; // Allow default behaviour (visible to match participants)
+                return false;   // Hidden from everyone else
             }
             
-            return null; // Default behavior
+            // If the VIEWER (target) is in an active match, only their match opponent
+            // should be visible to them.
+            if (activeMatches.ContainsKey(target.userID))
+            {
+                var match = activeMatches[target.userID];
+                if (subjectPlayer.userID == match.Player1ID || subjectPlayer.userID == match.Player2ID)
+                    return null; // Allow default behaviour
+                return false;   // Lobby players (and their items) hidden from match players
+            }
+            
+            // Neither the subject nor the viewer is in a match — both are in the lobby.
+            // Always allow a player to see their own entity; hide everyone else.
+            if (subjectPlayer.userID == target.userID) return null;
+            return false;
         }
         
         #endregion
