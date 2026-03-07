@@ -524,7 +524,7 @@ namespace Oxide.Plugins
             
             if (arenaManager.IsLobbySet())
             {
-                player.Teleport(arenaManager.GetLobbyPosition());
+                player.Teleport(arenaManager.GetRandomLobbySpawn());
                 SendReply(player, "Welcome to the lobby!");
             }
             else
@@ -1197,7 +1197,56 @@ namespace Oxide.Plugins
                 case "setpos":
                     arenaManager.SetLobby(player.transform.position, arenaManager.GetLobbyRadius());
                     SaveLobbyData();
-                    SendReply(player, $"Lobby position set to: {player.transform.position}");
+                    SendReply(player, $"Lobby spawn 1 set to: {player.transform.position}\nUse /lobby addspawn to add more spawn points.");
+                    break;
+                    
+                case "addspawn":
+                    arenaManager.AddLobbySpawn(player.transform.position);
+                    SaveLobbyData();
+                    int spawnCount = arenaManager.GetLobbySpawnPoints().Count;
+                    SendReply(player, $"Lobby spawn point {spawnCount} added at: {player.transform.position}");
+                    break;
+                    
+                case "removespawn":
+                    if (args.Length < 2)
+                    {
+                        SendReply(player, $"Usage: /lobby removespawn <number>\nUse /lobby listspawns to see spawn numbers.");
+                        return;
+                    }
+                    int removeIndex;
+                    if (int.TryParse(args[1], out removeIndex) && removeIndex >= 1)
+                    {
+                        if (arenaManager.RemoveLobbySpawn(removeIndex - 1))
+                        {
+                            SaveLobbyData();
+                            SendReply(player, $"Lobby spawn point {removeIndex} removed. Remaining: {arenaManager.GetLobbySpawnPoints().Count}");
+                        }
+                        else
+                        {
+                            SendReply(player, $"Invalid spawn number. Use /lobby listspawns to see valid numbers.");
+                        }
+                    }
+                    else
+                    {
+                        SendReply(player, "Invalid number. Usage: /lobby removespawn <number>");
+                    }
+                    break;
+                    
+                case "listspawns":
+                    var spawnPoints = arenaManager.GetLobbySpawnPoints();
+                    if (spawnPoints.Count == 0)
+                    {
+                        SendReply(player, "No lobby spawn points set. Use /lobby setpos or /lobby addspawn.");
+                    }
+                    else
+                    {
+                        var sb = new System.Text.StringBuilder();
+                        sb.AppendLine($"Lobby spawn points ({spawnPoints.Count} total):");
+                        for (int i = 0; i < spawnPoints.Count; i++)
+                            sb.AppendLine($"  {i + 1}: {spawnPoints[i]}");
+                        sb.AppendLine($"Zone radius: {arenaManager.GetLobbyRadius()}m");
+                        SendReply(player, sb.ToString().TrimEnd());
+                    }
                     break;
                     
                 case "setradius":
@@ -1210,7 +1259,7 @@ namespace Oxide.Plugins
                     float lobbyRadius;
                     if (float.TryParse(args[1], out lobbyRadius) && lobbyRadius > 0)
                     {
-                        arenaManager.SetLobby(arenaManager.GetLobbyPosition(), lobbyRadius);
+                        arenaManager.SetLobbyRadius(lobbyRadius);
                         SaveLobbyData();
                         SendReply(player, $"Lobby radius set to: {lobbyRadius}m");
                     }
@@ -1223,7 +1272,10 @@ namespace Oxide.Plugins
                 default:
                     SendReply(player, "Lobby Commands:\n" +
                                      "/lobby - Teleport to lobby\n" +
-                                     "/lobby setpos - Set lobby position (Admin)\n" +
+                                     "/lobby setpos - Set (or replace) spawn point 1\n" +
+                                     "/lobby addspawn - Add another spawn point at your position\n" +
+                                     "/lobby removespawn <n> - Remove spawn point by number\n" +
+                                     "/lobby listspawns - List all spawn points\n" +
                                      "/lobby setradius <radius> - Set lobby zone radius (Admin)");
                     break;
             }
@@ -1989,7 +2041,7 @@ namespace Oxide.Plugins
             // Teleport to lobby if configured, otherwise use default spawn
             if (arenaManager.IsLobbySet())
             {
-                player.Teleport(arenaManager.GetLobbyPosition());
+                player.Teleport(arenaManager.GetRandomLobbySpawn());
             }
             else
             {
@@ -2237,8 +2289,13 @@ namespace Oxide.Plugins
         {
             if (player == null || !arenaManager.IsLobbySet()) return true;
             
-            float distance = Vector3.Distance(player.transform.position, arenaManager.GetLobbyPosition());
-            return distance <= arenaManager.GetLobbyRadius();
+            float radius = arenaManager.GetLobbyRadius();
+            foreach (var spawn in arenaManager.GetLobbySpawnPoints())
+            {
+                if (Vector3.Distance(player.transform.position, spawn) <= radius)
+                    return true;
+            }
+            return false;
         }
         
         private bool IsInArenaZone(BasePlayer player, Arena arena)
@@ -4674,8 +4731,16 @@ namespace Oxide.Plugins
                 var data = Interface.Oxide.DataFileSystem.ReadObject<LobbyData>("HellisPlugin_Lobby");
                 if (data != null && data.IsSet)
                 {
-                    arenaManager.SetLobby(data.Position, data.Radius);
-                    Puts($"Loaded lobby position from data file");
+                    // Prefer the new list; fall back to legacy single position for backward compat
+                    if (data.SpawnPoints != null && data.SpawnPoints.Count > 0)
+                    {
+                        arenaManager.SetLobbySpawnPoints(data.SpawnPoints, data.Radius);
+                    }
+                    else
+                    {
+                        arenaManager.SetLobby(data.Position, data.Radius);
+                    }
+                    Puts($"Loaded {arenaManager.GetLobbySpawnPoints().Count} lobby spawn point(s) from data file");
                 }
             }
             catch (Exception ex)
@@ -4688,9 +4753,12 @@ namespace Oxide.Plugins
         {
             try
             {
+                var spawns = arenaManager.GetLobbySpawnPoints();
                 Interface.Oxide.DataFileSystem.WriteObject("HellisPlugin_Lobby", new LobbyData
                 {
-                    Position = arenaManager.GetLobbyPosition(),
+                    // Persist the full list; keep Position as first entry for backward compat
+                    Position = spawns.Count > 0 ? spawns[0] : Vector3.zero,
+                    SpawnPoints = new List<Vector3>(spawns),
                     Radius = arenaManager.GetLobbyRadius(),
                     IsSet = arenaManager.IsLobbySet()
                 });
@@ -4703,7 +4771,8 @@ namespace Oxide.Plugins
         
         private class LobbyData
         {
-            public Vector3 Position;
+            public Vector3 Position;         // legacy single-point field (kept for backward compat)
+            public List<Vector3> SpawnPoints; // multi-spawn list (preferred)
             public float Radius = 10f;
             public bool IsSet;
         }
@@ -4884,9 +4953,8 @@ namespace Oxide.Plugins
             private int lastArenaIndex = -1; // Track last used arena for round-robin distribution
             
             // Lobby state stored independently of arenas
-            private Vector3 lobbyPosition;
+            private List<Vector3> lobbySpawnPoints = new List<Vector3>();
             private float lobbyRadius = 10f;
-            private bool lobbyPositionSet;
             
             public ArenaManager(List<ArenaConfig> configs, int maxInstances = 5)
             {
@@ -5005,17 +5073,56 @@ namespace Oxide.Plugins
             }
             
             // Lobby helper methods
-            public Vector3 GetLobbyPosition() => lobbyPosition;
+            public Vector3 GetLobbyPosition() => lobbySpawnPoints.Count > 0 ? lobbySpawnPoints[0] : Vector3.zero;
+            
+            public Vector3 GetRandomLobbySpawn()
+            {
+                if (lobbySpawnPoints.Count == 0) return Vector3.zero;
+                if (lobbySpawnPoints.Count == 1) return lobbySpawnPoints[0];
+                return lobbySpawnPoints[UnityEngine.Random.Range(0, lobbySpawnPoints.Count)];
+            }
+            
+            public List<Vector3> GetLobbySpawnPoints() => lobbySpawnPoints;
             
             public float GetLobbyRadius() => lobbyRadius;
             
-            public bool IsLobbySet() => lobbyPositionSet;
+            public bool IsLobbySet() => lobbySpawnPoints.Count > 0;
             
+            // Set (or replace) spawn point 1 — used by /lobby setpos and legacy load path
             public void SetLobby(Vector3 position, float radius)
             {
-                lobbyPosition = position;
                 lobbyRadius = radius;
-                lobbyPositionSet = true;
+                if (lobbySpawnPoints.Count == 0)
+                    lobbySpawnPoints.Add(position);
+                else
+                    lobbySpawnPoints[0] = position;
+            }
+            
+            // Set radius without touching spawn points — used by /lobby setradius
+            public void SetLobbyRadius(float radius)
+            {
+                lobbyRadius = radius;
+            }
+            
+            // Add an additional spawn point — used by /lobby addspawn
+            public void AddLobbySpawn(Vector3 position)
+            {
+                lobbySpawnPoints.Add(position);
+            }
+            
+            // Remove a spawn point by index; returns false if index is out of range
+            public bool RemoveLobbySpawn(int index)
+            {
+                if (index < 0 || index >= lobbySpawnPoints.Count) return false;
+                lobbySpawnPoints.RemoveAt(index);
+                return true;
+            }
+            
+            // Replace the entire list — used when loading persisted data
+            public void SetLobbySpawnPoints(List<Vector3> points, float radius)
+            {
+                lobbySpawnPoints = points != null ? new List<Vector3>(points) : new List<Vector3>();
+                lobbyRadius = radius;
             }
         }
         
