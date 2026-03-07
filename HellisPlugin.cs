@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Network;
 using Newtonsoft.Json;
 using Oxide.Core;
 using Oxide.Core.Plugins;
@@ -532,13 +533,11 @@ namespace Oxide.Plugins
                 SendReply(player, "⚠ Lobby not configured. Admin: use /lobby setpos to set lobby location.");
             }
             
-            // Force network re-evaluation for ALL connected players so CanNetworkTo is
-            // applied in every direction, making lobby players invisible to each other.
-            foreach (var p in BasePlayer.activePlayerList)
-            {
-                if (p != null && p.IsConnected)
-                    p.SendNetworkUpdateImmediate();
-            }
+            // Force-hide this player from all lobby players and vice versa.
+            // CanNetworkTo returning false alone is insufficient: it blocks future updates
+            // but does not destroy entities already visible on clients (causing frozen models).
+            // Sending explicit EntityDestroy packets via HidePlayerInLobby eliminates this.
+            HidePlayerInLobby(player);
         }
         
         private object CanNetworkTo(BaseNetworkable entity, BasePlayer target)
@@ -1953,6 +1952,13 @@ namespace Oxide.Plugins
             activeMatches.Remove(match.Player1ID);
             activeMatches.Remove(match.Player2ID);
             
+            // Now that both players are removed from activeMatches they are lobby players again.
+            // ReturnPlayerToLobby called HidePlayerInLobby but skipped the former opponent
+            // because that player was still in activeMatches at that point.  Now that both
+            // entries have been removed we can properly hide each from the other.
+            if (player1 != null && player1.IsConnected) HidePlayerInLobby(player1);
+            if (player2 != null && player2.IsConnected) HidePlayerInLobby(player2);
+            
             // For room matches, try to start the next match from the waiting queue
             if (matchRoomID != null && privateRooms.ContainsKey(matchRoomID))
             {
@@ -2022,6 +2028,44 @@ namespace Oxide.Plugins
         
         #region Helpers
         
+        // Sends an explicit EntityDestroy packet to the viewer's client.
+        // CanNetworkTo returning false only blocks future network updates; it does NOT remove
+        // entities already present on a client, causing the "frozen model" visual bug.
+        // This method removes the entity immediately, solving the frozen-model problem.
+        private void ForceHideEntityFromPlayer(BaseNetworkable entity, BasePlayer viewer)
+        {
+            if (entity?.net == null || viewer?.Connection == null) return;
+            Net.sv.write.Start();
+            Net.sv.write.PacketID(Message.Type.EntityDestroy);
+            Net.sv.write.EntityID(entity.net.ID);
+            Net.sv.write.UInt8(0); // 0 = remove/destroy
+            Net.sv.write.Send(new SendInfo(viewer.Connection));
+        }
+        
+        // Hides arrivingPlayer (and their held item) from every non-match lobby player,
+        // and hides every non-match lobby player from arrivingPlayer.
+        // Call this whenever a player enters the lobby or returns from a match.
+        // Combined with CanNetworkTo returning false, this fully eliminates frozen models.
+        private void HidePlayerInLobby(BasePlayer arrivingPlayer)
+        {
+            if (arrivingPlayer == null) return;
+            var heldItem = arrivingPlayer.GetHeldEntity();
+            foreach (var other in BasePlayer.activePlayerList)
+            {
+                if (other == null || !other.IsConnected || other == arrivingPlayer) continue;
+                if (activeMatches.ContainsKey(other.userID)) continue;
+                
+                // Hide arrivingPlayer (and their held item) from other
+                ForceHideEntityFromPlayer(arrivingPlayer, other);
+                if (heldItem != null) ForceHideEntityFromPlayer(heldItem, other);
+                
+                // Hide other (and their held item) from arrivingPlayer
+                ForceHideEntityFromPlayer(other, arrivingPlayer);
+                var otherHeld = other.GetHeldEntity();
+                if (otherHeld != null) ForceHideEntityFromPlayer(otherHeld, arrivingPlayer);
+            }
+        }
+        
         private void TeleportPlayer(BasePlayer player, Vector3 position)
         {
             if (player == null) return;
@@ -2078,13 +2122,11 @@ namespace Oxide.Plugins
                 }
             }
             
-            // Force network re-evaluation for ALL connected players so CanNetworkTo is
-            // applied in every direction, making lobby players invisible to each other.
-            foreach (var p in BasePlayer.activePlayerList)
-            {
-                if (p != null && p.IsConnected)
-                    p.SendNetworkUpdateImmediate();
-            }
+            // Hide this returning player from all lobby bystanders and vice versa.
+            // Note: if this player's former match opponent is still in activeMatches at this
+            // point, HidePlayerInLobby will skip them; EndMatch calls HidePlayerInLobby again
+            // after activeMatches.Remove to handle the former-opponent pair correctly.
+            HidePlayerInLobby(player);
         }
         
         private void GiveLoadout(BasePlayer player, DuelMode mode, string customModeName = null, string arenaKitOverride = null)
