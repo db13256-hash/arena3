@@ -4171,6 +4171,7 @@ namespace Oxide.Plugins
             builder.Spawn1 = player.transform.position;
             SendReply(player, $"Spawn point 1 set at {builder.Spawn1}\n" +
                              "Now move to the second spawn point and use /arena setspawn2");
+            StartBuilderVisualization(player, builder);
         }
         
         private void SetSpawn2(BasePlayer player)
@@ -4192,6 +4193,8 @@ namespace Oxide.Plugins
             builder.Spawn2 = player.transform.position;
             SendReply(player, $"Spawn point 2 set at {builder.Spawn2}\n" +
                              "Arena is ready! Use /arena save to save it.");
+            // Restart visualization so it now also draws spawn2 and the full zone
+            StartBuilderVisualization(player, builder);
         }
         
         private void SaveArena(BasePlayer player)
@@ -4230,6 +4233,7 @@ namespace Oxide.Plugins
                              $"Spawn 1: {builder.Spawn1}\n" +
                              $"Spawn 2: {builder.Spawn2}");
             
+            StopBuilderVisualization(builder);
             arenaBuilders.Remove(player.userID);
         }
         
@@ -4242,8 +4246,90 @@ namespace Oxide.Plugins
             }
             
             var builder = arenaBuilders[player.userID];
+            StopBuilderVisualization(builder);
             arenaBuilders.Remove(player.userID);
             SendReply(player, $"Cancelled creation of arena '{builder.Name}'");
+        }
+        
+        // Draw ddraw sphere + text label markers for spawn points and the arena zone radius.
+        // Duration is set to just over the refresh interval so visuals never flicker out.
+        private const float VisualizationRefreshInterval = 3f;
+        private const float VisualizationDuration = 3.5f;
+        
+        private void DrawArenaBuilderVisuals(BasePlayer player, ArenaBuilder builder)
+        {
+            if (player == null || !player.IsConnected) return;
+            
+            Color spawn1Color = new Color(0f, 1f, 0f);   // green
+            Color spawn2Color = new Color(1f, 0.4f, 0f); // orange
+            Color zoneColor   = new Color(0f, 0.6f, 1f); // cyan
+            
+            if (builder.Spawn1 != Vector3.zero)
+            {
+                // Small sphere at spawn 1 with an elevated text label
+                player.SendConsoleCommand("ddraw.sphere",
+                    VisualizationDuration, spawn1Color, builder.Spawn1, 0.5f);
+                player.SendConsoleCommand("ddraw.text",
+                    VisualizationDuration, spawn1Color,
+                    builder.Spawn1 + Vector3.up * 2f,
+                    $"<size=18>SPAWN 1\n{builder.Spawn1}</size>");
+            }
+            
+            if (builder.Spawn2 != Vector3.zero)
+            {
+                // Small sphere at spawn 2 with an elevated text label
+                player.SendConsoleCommand("ddraw.sphere",
+                    VisualizationDuration, spawn2Color, builder.Spawn2, 0.5f);
+                player.SendConsoleCommand("ddraw.text",
+                    VisualizationDuration, spawn2Color,
+                    builder.Spawn2 + Vector3.up * 2f,
+                    $"<size=18>SPAWN 2\n{builder.Spawn2}</size>");
+            }
+            
+            // Draw the zone as a sphere centred at the midpoint between the two spawns
+            // (or at spawn1 alone if spawn2 isn't set yet), using the default arena radius.
+            if (builder.Spawn1 != Vector3.zero)
+            {
+                Vector3 center = builder.Spawn2 != Vector3.zero
+                    ? (builder.Spawn1 + builder.Spawn2) * 0.5f
+                    : builder.Spawn1;
+                float radius = 30f; // Default arena radius
+                player.SendConsoleCommand("ddraw.sphere",
+                    VisualizationDuration, zoneColor, center, radius);
+                player.SendConsoleCommand("ddraw.text",
+                    VisualizationDuration, zoneColor,
+                    center + Vector3.up * (radius + 1f),
+                    $"<size=18>{builder.Name}\nZONE r={radius}m</size>");
+            }
+        }
+        
+        private void StartBuilderVisualization(BasePlayer player, ArenaBuilder builder)
+        {
+            StopBuilderVisualization(builder);
+            // Draw immediately and then on every interval
+            DrawArenaBuilderVisuals(player, builder);
+            ulong playerID = player.userID;
+            builder.VisualizationTimer = timer.Every(VisualizationRefreshInterval, () =>
+            {
+                if (!arenaBuilders.ContainsKey(playerID))
+                {
+                    StopBuilderVisualization(builder);
+                    return;
+                }
+                var livePlayer = BasePlayer.FindByID(playerID);
+                if (livePlayer == null || !livePlayer.IsConnected)
+                    return;
+                DrawArenaBuilderVisuals(livePlayer, builder);
+            });
+        }
+        
+        private void StopBuilderVisualization(ArenaBuilder builder)
+        {
+            if (builder.VisualizationTimer != null)
+            {
+                builder.VisualizationTimer.Destroy();
+                builder.VisualizationTimer = null;
+            }
         }
         
         private void ListArenas(BasePlayer player)
@@ -4451,6 +4537,11 @@ namespace Oxide.Plugins
         
         private void Unload()
         {
+            // Stop all active arena-builder visualization timers
+            foreach (var builder in arenaBuilders.Values)
+                StopBuilderVisualization(builder);
+            arenaBuilders.Clear();
+            
             // Destroy all UI elements for every connected player before the plugin is unloaded.
             // Without this, Oxide leaves stale CUI panels on screen permanently.
             foreach (var player in BasePlayer.activePlayerList)
@@ -5007,6 +5098,8 @@ namespace Oxide.Plugins
             public string Name;
             public Vector3 Spawn1 = Vector3.zero;
             public Vector3 Spawn2 = Vector3.zero;
+            // Repeating timer that refreshes ddraw visuals for this builder session.
+            public Oxide.Core.Libraries.Timer VisualizationTimer;
         }
         
         // Queue types for lobby browser
