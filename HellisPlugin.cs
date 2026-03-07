@@ -1250,11 +1250,14 @@ namespace Oxide.Plugins
             {
                 SendReply(player, "Arena Commands:\n" +
                                  "/arena create <name> - Start creating a new arena\n" +
+                                 "/arena edit <name> - Edit an existing arena (shows zone & spawns)\n" +
                                  "/arena setspawn1 - Set first spawn point\n" +
                                  "/arena setspawn2 - Set second spawn point\n" +
-                                 "/arena setradius <radius> - Set zone radius during creation (default: 30m)\n" +
+                                 "/arena setradius <radius> - Set zone radius during create/edit (default: 30m)\n" +
+                                 "/arena setlobbyspawn - Set per-arena lobby spawn during create/edit\n" +
+                                 "/arena setlobbyradius <radius> - Set lobby zone radius during create/edit (default: 10m)\n" +
                                  "/arena save - Save the arena\n" +
-                                 "/arena cancel - Cancel arena creation\n" +
+                                 "/arena cancel - Cancel arena creation/editing\n" +
                                  "/arena list - List all arenas\n" +
                                  "/arena delete <name> - Delete an arena\n" +
                                  "/arena setradius <name> <radius> - Change radius of a saved arena\n" +
@@ -1277,12 +1280,34 @@ namespace Oxide.Plugins
                     CreateArena(player, string.Join(" ", args.Skip(1)));
                     break;
                     
+                case "edit":
+                    if (args.Length < 2)
+                    {
+                        SendReply(player, "Usage: /arena edit <name>");
+                        return;
+                    }
+                    EditArena(player, string.Join(" ", args.Skip(1)));
+                    break;
+                    
                 case "setspawn1":
                     SetSpawn1(player);
                     break;
                     
                 case "setspawn2":
                     SetSpawn2(player);
+                    break;
+                    
+                case "setlobbyspawn":
+                    SetLobbySpawn(player);
+                    break;
+                    
+                case "setlobbyradius":
+                    if (args.Length < 2)
+                    {
+                        SendReply(player, "Usage: /arena setlobbyradius <radius>");
+                        return;
+                    }
+                    SetLobbyRadius(player, args[1]);
                     break;
                     
                 case "save":
@@ -4178,14 +4203,16 @@ namespace Oxide.Plugins
                              "Step 1: Move to the first spawn point and use /arena setspawn1\n" +
                              "Step 2: Move to the second spawn point and use /arena setspawn2\n" +
                              "Step 3: (Optional) Use /arena setradius <radius> to adjust the zone size (default: 30m)\n" +
-                             "Step 4: Use /arena save to save the arena");
+                             "Step 4: (Optional) Move to the lobby position and use /arena setlobbyspawn\n" +
+                             "Step 5: (Optional) Use /arena setlobbyradius <radius> to adjust the lobby zone size (default: 10m)\n" +
+                             "Step 6: Use /arena save to save the arena");
         }
         
         private void SetSpawn1(BasePlayer player)
         {
             if (!arenaBuilders.ContainsKey(player.userID))
             {
-                SendReply(player, "You're not creating an arena. Use /arena create <name> first.");
+                SendReply(player, "You're not in a builder session. Use /arena create <name> or /arena edit <name> first.");
                 return;
             }
             
@@ -4200,7 +4227,7 @@ namespace Oxide.Plugins
         {
             if (!arenaBuilders.ContainsKey(player.userID))
             {
-                SendReply(player, "You're not creating an arena. Use /arena create <name> first.");
+                SendReply(player, "You're not in a builder session. Use /arena create <name> or /arena edit <name> first.");
                 return;
             }
             
@@ -4223,7 +4250,7 @@ namespace Oxide.Plugins
         {
             if (!arenaBuilders.ContainsKey(player.userID))
             {
-                SendReply(player, "You're not creating an arena. Use /arena create <name> first.");
+                SendReply(player, "You're not in a builder session. Use /arena create <name> or /arena edit <name> first.");
                 return;
             }
             
@@ -4236,25 +4263,58 @@ namespace Oxide.Plugins
                 return;
             }
             
-            // Add to configuration
-            var arenaConfig = new ArenaConfig
+            bool lobbySet = builder.LobbySpawn != Vector3.zero;
+            
+            if (builder.IsEditing)
             {
-                Name = builder.Name,
-                Spawn1 = builder.Spawn1,
-                Spawn2 = builder.Spawn2,
-                Radius = builder.Radius
-            };
-            
-            // Add to arena list
-            arenas.Add(arenaConfig);
-            SaveArenas(); // Save arenas to data file
-            
-            // Add to arena manager
-            arenaManager.AddArena(arenaConfig);
-            
-            SendReply(player, $"Arena '{builder.Name}' saved successfully!\n" +
-                             $"Spawn 1: {builder.Spawn1}\n" +
-                             $"Spawn 2: {builder.Spawn2}");
+                // Update the existing ArenaConfig entry
+                var existingConfig = arenas.FirstOrDefault(a =>
+                    a.Name.Equals(builder.Name, StringComparison.OrdinalIgnoreCase));
+                if (existingConfig == null)
+                {
+                    SendReply(player, $"Error: Arena '{builder.Name}' not found in data. Aborting.");
+                    StopBuilderVisualization(builder);
+                    arenaBuilders.Remove(player.userID);
+                    return;
+                }
+                existingConfig.Spawn1 = builder.Spawn1;
+                existingConfig.Spawn2 = builder.Spawn2;
+                existingConfig.Radius = builder.Radius;
+                existingConfig.LobbyPosition = builder.LobbySpawn;
+                existingConfig.LobbyRadius = builder.LobbyRadius;
+                existingConfig.LobbyPositionSet = lobbySet;
+                SaveArenas();
+                arenaManager.UpdateArena(existingConfig);
+                
+                string lobbyMsg = lobbySet ? $"\nLobby: {builder.LobbySpawn} r={builder.LobbyRadius}m" : "";
+                SendReply(player, $"Arena '{builder.Name}' updated successfully!\n" +
+                                 $"Spawn 1: {builder.Spawn1}\n" +
+                                 $"Spawn 2: {builder.Spawn2}\n" +
+                                 $"Zone radius: {builder.Radius}m" + lobbyMsg);
+            }
+            else
+            {
+                // Create a new ArenaConfig
+                var arenaConfig = new ArenaConfig
+                {
+                    Name = builder.Name,
+                    Spawn1 = builder.Spawn1,
+                    Spawn2 = builder.Spawn2,
+                    Radius = builder.Radius,
+                    LobbyPosition = builder.LobbySpawn,
+                    LobbyRadius = builder.LobbyRadius,
+                    LobbyPositionSet = lobbySet
+                };
+                arenas.Add(arenaConfig);
+                SaveArenas();
+                arenaManager.AddArena(arenaConfig);
+                
+                string lobbyMsg = lobbySet ? $"\nLobby: {builder.LobbySpawn} r={builder.LobbyRadius}m" : "";
+                SendReply(player, $"Arena '{builder.Name}' saved successfully!\n" +
+                                 $"Spawn 1: {builder.Spawn1}\n" +
+                                 $"Spawn 2: {builder.Spawn2}\n" +
+                                 $"Zone radius: {builder.Radius}m" + lobbyMsg);
+            }
             
             StopBuilderVisualization(builder);
             arenaBuilders.Remove(player.userID);
@@ -4264,14 +4324,98 @@ namespace Oxide.Plugins
         {
             if (!arenaBuilders.ContainsKey(player.userID))
             {
-                SendReply(player, "You're not creating an arena.");
+                SendReply(player, "You're not in a builder session.");
                 return;
             }
             
             var builder = arenaBuilders[player.userID];
             StopBuilderVisualization(builder);
             arenaBuilders.Remove(player.userID);
-            SendReply(player, $"Cancelled creation of arena '{builder.Name}'");
+            string action = builder.IsEditing ? "Cancelled editing" : "Cancelled creation";
+            SendReply(player, $"{action} of arena '{builder.Name}'");
+        }
+        
+        private void EditArena(BasePlayer player, string name)
+        {
+            if (arenaBuilders.ContainsKey(player.userID))
+            {
+                SendReply(player, "You're already in a builder session. Use /arena cancel first.");
+                return;
+            }
+            
+            var arena = arenaManager.GetArenaByName(name);
+            if (arena == null)
+            {
+                SendReply(player, $"Arena '{name}' not found.");
+                return;
+            }
+            
+            if (arenaManager.IsArenaInUse(name))
+            {
+                SendReply(player, $"Arena '{name}' is currently in use. Cannot edit.");
+                return;
+            }
+            
+            string lobbyInfo = arena.LobbyPositionSet
+                ? $"\nLobby spawn: {arena.LobbyPosition} r={arena.LobbyRadius}m"
+                : "\nNo lobby spawn set";
+            
+            arenaBuilders[player.userID] = new ArenaBuilder
+            {
+                Name = arena.Name,
+                Spawn1 = arena.Spawn1,
+                Spawn2 = arena.Spawn2,
+                Radius = arena.Radius,
+                LobbySpawn = arena.LobbyPositionSet ? arena.LobbyPosition : Vector3.zero,
+                LobbyRadius = arena.LobbyRadius,
+                IsEditing = true
+            };
+            
+            StartBuilderVisualization(player, arenaBuilders[player.userID]);
+            
+            SendReply(player, $"Editing arena '{name}'.\n" +
+                             $"Spawn 1: {arena.Spawn1}\n" +
+                             $"Spawn 2: {arena.Spawn2}\n" +
+                             $"Zone radius: {arena.Radius}m" + lobbyInfo + "\n" +
+                             "Use /arena setspawn1, /arena setspawn2, /arena setradius, /arena setlobbyspawn, /arena setlobbyradius to adjust.\n" +
+                             "Use /arena save to save or /arena cancel to discard changes.");
+        }
+        
+        private void SetLobbySpawn(BasePlayer player)
+        {
+            if (!arenaBuilders.ContainsKey(player.userID))
+            {
+                SendReply(player, "You're not in a builder session. Use /arena create <name> or /arena edit <name> first.");
+                return;
+            }
+            
+            var builder = arenaBuilders[player.userID];
+            builder.LobbySpawn = player.transform.position;
+            SendReply(player, $"Lobby spawn set at {builder.LobbySpawn} (radius: {builder.LobbyRadius}m)\n" +
+                             "Use /arena setlobbyradius <radius> to adjust the lobby zone size.");
+            StartBuilderVisualization(player, builder);
+        }
+        
+        private void SetLobbyRadius(BasePlayer player, string radiusArg)
+        {
+            if (!arenaBuilders.ContainsKey(player.userID))
+            {
+                SendReply(player, "You're not in a builder session. Use /arena create <name> or /arena edit <name> first.");
+                return;
+            }
+            
+            float newRadius;
+            if (!float.TryParse(radiusArg, out newRadius) || newRadius <= 0)
+            {
+                SendReply(player, "Invalid radius. Please enter a positive number.");
+                return;
+            }
+            
+            var builder = arenaBuilders[player.userID];
+            builder.LobbyRadius = newRadius;
+            SendReply(player, $"Lobby radius set to {newRadius}m.");
+            if (builder.LobbySpawn != Vector3.zero)
+                StartBuilderVisualization(player, builder);
         }
         
         // Draw ddraw sphere + text label markers for spawn points and the arena zone radius.
@@ -4286,6 +4430,7 @@ namespace Oxide.Plugins
             Color spawn1Color = new Color(0f, 1f, 0f);   // green
             Color spawn2Color = new Color(1f, 0.4f, 0f); // orange
             Color zoneColor   = new Color(0f, 0.6f, 1f); // cyan
+            Color lobbyColor  = new Color(1f, 1f, 0f);   // yellow
             
             if (builder.Spawn1 != Vector3.zero)
             {
@@ -4307,6 +4452,19 @@ namespace Oxide.Plugins
                     VisualizationDuration, spawn2Color,
                     builder.Spawn2 + Vector3.up * 2f,
                     $"<size=18>SPAWN 2\n{builder.Spawn2}</size>");
+            }
+            
+            // Draw the lobby spawn if set
+            if (builder.LobbySpawn != Vector3.zero)
+            {
+                player.SendConsoleCommand("ddraw.sphere",
+                    VisualizationDuration, lobbyColor, builder.LobbySpawn, 0.5f);
+                player.SendConsoleCommand("ddraw.sphere",
+                    VisualizationDuration, lobbyColor, builder.LobbySpawn, builder.LobbyRadius);
+                player.SendConsoleCommand("ddraw.text",
+                    VisualizationDuration, lobbyColor,
+                    builder.LobbySpawn + Vector3.up * (builder.LobbyRadius + 1f),
+                    $"<size=18>LOBBY r={builder.LobbyRadius}m</size>");
             }
             
             // Draw the zone as a sphere centred at the midpoint between the two spawns
@@ -4809,6 +4967,21 @@ namespace Oxide.Plugins
                 arenas.RemoveAll(a => a.Name == name);
             }
             
+            // Update an existing live Arena object in place from an ArenaConfig (used by /arena edit + save).
+            public void UpdateArena(ArenaConfig config)
+            {
+                var arena = arenas.FirstOrDefault(a =>
+                    a.Name.Equals(config.Name, StringComparison.OrdinalIgnoreCase));
+                if (arena == null) return;
+                arena.Spawn1 = config.Spawn1;
+                arena.Spawn2 = config.Spawn2;
+                arena.Radius = config.Radius;
+                arena.LobbyPosition = config.LobbyPosition;
+                arena.LobbyRadius = config.LobbyRadius;
+                arena.LobbyPositionSet = config.LobbyPositionSet;
+                arena.KitOverrides = config.KitOverrides != null ? new List<string>(config.KitOverrides) : new List<string>();
+            }
+            
             // Update the kit override list on a live Arena object (called by /arena setkit, addkit, removekit, clearkit).
             public void SetArenaKitOverrides(string arenaName, List<string> kitOverrides)
             {
@@ -5122,6 +5295,10 @@ namespace Oxide.Plugins
             public Vector3 Spawn1 = Vector3.zero;
             public Vector3 Spawn2 = Vector3.zero;
             public float Radius = 30f;
+            public Vector3 LobbySpawn = Vector3.zero;
+            public float LobbyRadius = 10f;
+            // True when editing an existing arena rather than creating a new one.
+            public bool IsEditing = false;
             // Repeating timer that refreshes ddraw visuals for this builder session.
             public Oxide.Plugins.Timer VisualizationTimer;
         }
