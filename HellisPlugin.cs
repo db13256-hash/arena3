@@ -311,6 +311,13 @@ namespace Oxide.Plugins
                 Puts("1v1 Duel mode enabled");
             }
             
+            // Remove all animals that are already present and prevent future spawns.
+            foreach (var entity in BaseNetworkable.serverEntities.ToList())
+            {
+                if (entity is BaseAnimalNPC animal && !animal.IsDestroyed)
+                    animal.Kill();
+            }
+            
             timer.Every(1f, () => ProcessMatchmaking());
         }
         
@@ -596,8 +603,16 @@ namespace Oxide.Plugins
         
         // Track placed entities (walls, deployables, etc.) so they can be removed between
         // rounds and on match end, and so CanNetworkTo can isolate them per match.
+        // Also prevents animals from existing on the server.
         private void OnEntitySpawned(BaseNetworkable entity)
         {
+            // Remove any animal the instant it spawns.
+            if (entity is BaseAnimalNPC animal)
+            {
+                NextTick(() => { if (animal != null && !animal.IsDestroyed) animal.Kill(); });
+                return;
+            }
+            
             var baseEntity = entity as BaseEntity;
             if (baseEntity == null || baseEntity.net == null) return;
             if (baseEntity.OwnerID == 0) return;
