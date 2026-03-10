@@ -549,8 +549,24 @@ namespace Oxide.Plugins
             if (subjectPlayer == null && entity is HeldEntity heldEntity)
                 subjectPlayer = heldEntity.GetOwnerPlayer();
             
-            // Not a player-owned entity — leave default networking behaviour.
-            if (subjectPlayer == null) return null;
+            // For placed entities (walls, deployables, etc.) that are not player-bodies
+            // or held items, check the BaseEntity.OwnerID.  If the owner is in an active
+            // match the entity must only be visible to that match's two participants —
+            // hiding it from the other concurrent match sharing the same arena and from
+            // lobby players.
+            if (subjectPlayer == null)
+            {
+                var baseEntity = entity as BaseEntity;
+                if (baseEntity != null && baseEntity.OwnerID != 0 &&
+                    activeMatches.TryGetValue(baseEntity.OwnerID, out var ownerMatch))
+                {
+                    if (target.userID == ownerMatch.Player1ID || target.userID == ownerMatch.Player2ID)
+                        return null; // Visible to match participants
+                    return false;   // Hidden from everyone else
+                }
+                // Not a player-owned entity — leave default networking behaviour.
+                return null;
+            }
             
             // If the subject player is in an active match, only their match opponent
             // (and themselves) should see them.
@@ -576,6 +592,18 @@ namespace Oxide.Plugins
             // Always allow a player to see their own entity; hide everyone else.
             if (subjectPlayer.userID == target.userID) return null;
             return false;
+        }
+        
+        // Track placed entities (walls, deployables, etc.) so they can be removed between
+        // rounds and on match end, and so CanNetworkTo can isolate them per match.
+        private void OnEntitySpawned(BaseNetworkable entity)
+        {
+            var baseEntity = entity as BaseEntity;
+            if (baseEntity == null || baseEntity.net == null) return;
+            if (baseEntity.OwnerID == 0) return;
+            if (entity is BasePlayer || entity is HeldEntity) return;
+            if (!activeMatches.TryGetValue(baseEntity.OwnerID, out var match)) return;
+            match.SpawnedEntities.Add(baseEntity);
         }
         
         #endregion
@@ -1779,7 +1807,7 @@ namespace Oxide.Plugins
             }
             else if (match.IsRoundFinished())
             {
-                // Start next round - reset both players without death/respawn
+                // Reset both players first so round progression is never blocked by cleanup.
                 var player1 = BasePlayer.FindByID(match.Player1ID);
                 var player2 = BasePlayer.FindByID(match.Player2ID);
                 
@@ -1794,6 +1822,10 @@ namespace Oxide.Plugins
                     SendReply(player2, $"Round {match.CurrentRound}/{match.BestOfRounds} - Score: {match.Player1Score}-{match.Player2Score}");
                     ResetPlayerForNextRound(player2, match.Arena.Spawn2, match.Mode, match.CustomModeName, match.ResolvedArenaKit);
                 }
+                
+                // Clean up anything players built/deployed during the previous round.
+                // Done after player resets so cleanup failures cannot block round progression.
+                KillMatchEntities(match);
                 
                 timer.Once(config.CountdownDuration, () => StartRound(match));
             }
@@ -1948,6 +1980,9 @@ namespace Oxide.Plugins
             // Release arena instance
             arenaManager.ReleaseArenaInstance(match.Arena, match.InstanceID);
             
+            // Kill any walls/deployables placed during this match before returning players.
+            KillMatchEntities(match);
+            
             // Remove from active matches
             activeMatches.Remove(match.Player1ID);
             activeMatches.Remove(match.Player2ID);
@@ -2064,6 +2099,18 @@ namespace Oxide.Plugins
                 var otherHeld = other.GetHeldEntity();
                 if (otherHeld != null) ForceHideEntityFromPlayer(otherHeld, arrivingPlayer);
             }
+        }
+        
+        // Kills all entities placed during the given match (walls, deployables, etc.)
+        // and clears the tracking list.  Call between rounds and on match end.
+        private void KillMatchEntities(ActiveMatch match)
+        {
+            foreach (var ent in match.SpawnedEntities)
+            {
+                if (ent != null && !ent.IsDestroyed)
+                    ent.Kill();
+            }
+            match.SpawnedEntities.Clear();
         }
         
         private void TeleportPlayer(BasePlayer player, Vector3 position)
@@ -5390,6 +5437,8 @@ namespace Oxide.Plugins
             // Kit picked randomly from Arena.KitOverrides at match start; null means use mode-based kit.
             // Fixed for the entire match so all rounds use the same kit.
             public string ResolvedArenaKit = null;
+            // Entities placed during this match (walls, deployables, etc.) — killed between rounds and on match end.
+            public List<BaseEntity> SpawnedEntities = new List<BaseEntity>();
             
             public ActiveMatch(ulong p1, ulong p2, DuelMode mode, Arena arena, int instanceId, int bestOf)
             {
