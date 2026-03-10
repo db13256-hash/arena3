@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Network;
 using Newtonsoft.Json;
 using Oxide.Core;
 using Oxide.Core.Plugins;
@@ -27,10 +28,12 @@ namespace Oxide.Plugins
         private HashSet<ulong> activeJoinButtons = new HashSet<ulong>(); // Track players with join button
         private HashSet<ulong> activeLeaveButtons = new HashSet<ulong>(); // Track players with leave button
         private HashSet<ulong> autoRequeueOptOut = new HashSet<ulong>(); // Track players who opted out of auto-requeue
+        private HashSet<ulong> activeJoinRequestUIs = new HashSet<ulong>(); // Track players with pending-request overlay open
         private List<ArenaConfig> arenas = new List<ArenaConfig>(); // Arena storage (stored in data file, not config)
-        
         // Lobby browser system
         private Dictionary<QueueType, List<ulong>> queuesByType = new Dictionary<QueueType, List<ulong>>();
+        // Public queues for custom kits: kit name -> list of queued player IDs
+        private Dictionary<string, List<ulong>> customQueuesByName = new Dictionary<string, List<ulong>>(StringComparer.OrdinalIgnoreCase);
         private Dictionary<string, PrivateRoom> privateRooms = new Dictionary<string, PrivateRoom>();
         
         #endregion
@@ -61,7 +64,7 @@ namespace Oxide.Plugins
             public int CountdownDuration = 3;
             
             [JsonProperty("Best of X Rounds")]
-            public int BestOfRounds = 3;
+            public int BestOfRounds = 1;
             
             [JsonProperty("Auto Requeue After Match")]
             public bool AutoRequeue = true;
@@ -88,9 +91,10 @@ namespace Oxide.Plugins
             public int UIRefreshInterval = 30;
             
             [JsonProperty("Loadouts")]
-            public Dictionary<string, LoadoutConfig> Loadouts = GetDefaultLoadouts();
+            public Dictionary<string, LoadoutConfig> Loadouts = GetPublicDefaultLoadouts();
             
-            private static Dictionary<string, LoadoutConfig> GetDefaultLoadouts()
+            // Exposed so the /kit reset command can restore built-in defaults.
+            public static Dictionary<string, LoadoutConfig> GetPublicDefaultLoadouts()
             {
                 return new Dictionary<string, LoadoutConfig>
                 {
@@ -175,6 +179,9 @@ namespace Oxide.Plugins
             
             [JsonProperty("Amount")]
             public int Amount;
+            
+            [JsonProperty("SkinID")]
+            public ulong SkinID = 0;
         }
         
         // Arena configuration - defines duel arena spawn points
@@ -192,6 +199,10 @@ namespace Oxide.Plugins
             public Vector3 LobbyPosition;
             public float LobbyRadius = 10f;
             public bool LobbyPositionSet;
+            
+            // When non-empty, each match in this arena randomly picks one kit from this list.
+            // Empty list means use the global kit for the chosen mode.
+            public List<string> KitOverrides = new List<string>();
         }
         
         protected override void LoadConfig()
@@ -240,6 +251,13 @@ namespace Oxide.Plugins
                 queuesByType[queueType] = new List<ulong>();
             }
             
+            // Initialize public queues for custom kits
+            foreach (var key in config.Loadouts.Keys)
+            {
+                if (!BuiltInKitNames.Contains(key))
+                    customQueuesByName[key] = new List<ulong>();
+            }
+            
             // Migration: Move lobby from old config to arena data (one-time)
             // This happens automatically when plugin loads with old config
             // Note: We can't access config.LobbyPosition here since it's been removed
@@ -251,7 +269,7 @@ namespace Oxide.Plugins
             // Load persistent player data
             LoadData();
             
-            Puts($"Hellis Plugin v1.0.0 loaded - {config.ServerName}");
+            Puts($"Hellis Plugin v1.1.0 loaded - {config.ServerName}");
             Puts($"Multi-instance arenas enabled: {config.MaxInstancesPerArena} instances per arena");
             
             // Auto-save player data every 5 minutes
@@ -265,6 +283,10 @@ namespace Oxide.Plugins
             {
                 timer.Repeat(config.UIRefreshInterval, 0, () => RefreshAllPlayerUI());
             }
+            
+            // Periodically refresh leaderboard for players in active matches so the
+            // rolling time-window clears expired entries in real-time.
+            timer.Repeat(30f, 0, () => RefreshAllLeaderboards());
             
             // Cleanup old stat events every 60 seconds to keep data manageable
             timer.Repeat(60f, 0, () => CleanupOldEvents());
@@ -289,6 +311,13 @@ namespace Oxide.Plugins
                 Puts("1v1 Duel mode enabled");
             }
             
+            // Remove all animals that are already present and prevent future spawns.
+            foreach (var entity in BaseNetworkable.serverEntities.ToList())
+            {
+                if (entity is BaseAnimalNPC animal && !animal.IsDestroyed)
+                    animal.Kill();
+            }
+            
             timer.Every(1f, () => ProcessMatchmaking());
         }
         
@@ -299,6 +328,24 @@ namespace Oxide.Plugins
                 // Check if player is in an active match
                 if (activeMatches.ContainsKey(player.userID))
                 {
+                    var match = activeMatches[player.userID];
+                    
+                    // Cross-match damage protection: block all damage from players who are NOT
+                    // this player's match opponent. This prevents physical interactions between
+                    // concurrent matches sharing the same arena spawn points.
+                    var attacker = info?.InitiatorPlayer;
+                    if (attacker != null)
+                    {
+                        bool isMatchOpponent = attacker.userID == match.Player1ID || attacker.userID == match.Player2ID;
+                        if (!isMatchOpponent)
+                        {
+                            info.damageTypes = new Rust.DamageTypeList();
+                            info.DoHitEffects = false;
+                            info.HitMaterial = 0;
+                            return true; // Block damage from outside this match
+                        }
+                    }
+                    
                     // Check if player already defeated this tick (prevents multiple headshots race condition)
                     if (defeatedThisTick.Contains(player.userID))
                     {
@@ -317,7 +364,6 @@ namespace Oxide.Plugins
                     if (player.health <= 10f || player.health - totalDamage <= 10f)
                     {
                         // Player is below/would be below 10 HP - intercept and reset!
-                        var match = activeMatches[player.userID];
                         
                         // Mark player as defeated IMMEDIATELY to prevent race conditions with rapid hits
                         defeatedThisTick.Add(player.userID);
@@ -435,8 +481,10 @@ namespace Oxide.Plugins
             }
             
             // Clean up UIs
-            DestroyLobbyBrowser(player); // Phase 2: Use lobby browser
+            DestroyLobbyBrowser(player);
             DestroyLeaderboardUI(player);
+            DestroyJoinRequestUI(player);
+            CuiHelper.DestroyUi(player, "RoomGunSelect");
         }
         
         private void OnPlayerConnected(BasePlayer player)
@@ -452,8 +500,6 @@ namespace Oxide.Plugins
                     
                     // Phase 2: Show lobby browser instead of simple button
                     ShowLobbyBrowser(player);
-                    
-                    ShowLeaderboardUI(player); // Show persistent leaderboard (always)
                     
                     // Send welcome and instructions
                     SendReply(player, "═══════════════════════════════════════");
@@ -481,55 +527,98 @@ namespace Oxide.Plugins
         {
             if (player == null || !player.IsConnected) return;
             
+            // Always clear inventory so players arrive in the lobby with nothing
+            player.inventory.Strip();
+            
             if (arenaManager.IsLobbySet())
             {
-                player.Teleport(arenaManager.GetLobbyPosition());
+                player.Teleport(arenaManager.GetRandomLobbySpawn());
                 SendReply(player, "Welcome to the lobby!");
             }
             else
             {
                 SendReply(player, "⚠ Lobby not configured. Admin: use /lobby setpos to set lobby location.");
             }
+            
+            // Force-hide this player from all lobby players and vice versa.
+            // CanNetworkTo returning false alone is insufficient: it blocks future updates
+            // but does not destroy entities already visible on clients (causing frozen models).
+            // Sending explicit EntityDestroy packets via HidePlayerInLobby eliminates this.
+            HidePlayerInLobby(player);
         }
         
         private object CanNetworkTo(BaseNetworkable entity, BasePlayer target)
         {
-            // Player visibility isolation for multi-instance arenas
-            // Players in a match can only see their opponent
-            if (entity is BasePlayer player)
+            // Determine which player "owns" the entity being networked.
+            // We treat both BasePlayer entities and HeldEntity items with the same
+            // visibility rules, so lobby players and their held items are all hidden.
+            BasePlayer subjectPlayer = entity as BasePlayer;
+            if (subjectPlayer == null && entity is HeldEntity heldEntity)
+                subjectPlayer = heldEntity.GetOwnerPlayer();
+            
+            // For placed entities (walls, deployables, etc.) that are not player-bodies
+            // or held items, check the BaseEntity.OwnerID.  If the owner is in an active
+            // match the entity must only be visible to that match's two participants —
+            // hiding it from the other concurrent match sharing the same arena and from
+            // lobby players.
+            if (subjectPlayer == null)
             {
-                // Check if the player is in an active match
-                if (activeMatches.ContainsKey(player.userID))
+                var baseEntity = entity as BaseEntity;
+                if (baseEntity != null && baseEntity.OwnerID != 0 &&
+                    activeMatches.TryGetValue(baseEntity.OwnerID, out var ownerMatch))
                 {
-                    var match = activeMatches[player.userID];
-                    
-                    // Allow visibility to opponent in the same match
-                    if (target.userID == match.Player1ID || target.userID == match.Player2ID)
-                    {
-                        return null; // Allow default behavior (visible)
-                    }
-                    
-                    // Hide from all other players
-                    return false;
+                    if (target.userID == ownerMatch.Player1ID || target.userID == ownerMatch.Player2ID)
+                        return null; // Visible to match participants
+                    return false;   // Hidden from everyone else
                 }
-                
-                // Check if the target is in an active match
-                if (activeMatches.ContainsKey(target.userID))
-                {
-                    var match = activeMatches[target.userID];
-                    
-                    // Only show to their opponent
-                    if (player.userID == match.Player1ID || player.userID == match.Player2ID)
-                    {
-                        return null; // Allow default behavior (visible)
-                    }
-                    
-                    // Hide from all other players
-                    return false;
-                }
+                // Not a player-owned entity — leave default networking behaviour.
+                return null;
             }
             
-            return null; // Default behavior
+            // If the subject player is in an active match, only their match opponent
+            // (and themselves) should see them.
+            if (activeMatches.ContainsKey(subjectPlayer.userID))
+            {
+                var match = activeMatches[subjectPlayer.userID];
+                if (target.userID == match.Player1ID || target.userID == match.Player2ID)
+                    return null; // Allow default behaviour (visible to match participants)
+                return false;   // Hidden from everyone else
+            }
+            
+            // If the VIEWER (target) is in an active match, only their match opponent
+            // should be visible to them.
+            if (activeMatches.ContainsKey(target.userID))
+            {
+                var match = activeMatches[target.userID];
+                if (subjectPlayer.userID == match.Player1ID || subjectPlayer.userID == match.Player2ID)
+                    return null; // Allow default behaviour
+                return false;   // Lobby players (and their items) hidden from match players
+            }
+            
+            // Neither the subject nor the viewer is in a match — both are in the lobby.
+            // Always allow a player to see their own entity; hide everyone else.
+            if (subjectPlayer.userID == target.userID) return null;
+            return false;
+        }
+        
+        // Track placed entities (walls, deployables, etc.) so they can be removed between
+        // rounds and on match end, and so CanNetworkTo can isolate them per match.
+        // Also prevents animals from existing on the server.
+        private void OnEntitySpawned(BaseNetworkable entity)
+        {
+            // Remove any animal the instant it spawns.
+            if (entity is BaseAnimalNPC animal)
+            {
+                NextTick(() => { if (animal != null && !animal.IsDestroyed) animal.Kill(); });
+                return;
+            }
+            
+            var baseEntity = entity as BaseEntity;
+            if (baseEntity == null || baseEntity.net == null) return;
+            if (baseEntity.OwnerID == 0) return;
+            if (entity is BasePlayer || entity is HeldEntity) return;
+            if (!activeMatches.TryGetValue(baseEntity.OwnerID, out var match)) return;
+            match.SpawnedEntities.Add(baseEntity);
         }
         
         #endregion
@@ -541,17 +630,43 @@ namespace Oxide.Plugins
         [ChatCommand("leave")]
         private void LeaveCommand(BasePlayer player, string command, string[] args)
         {
-            if (queueManager.LeaveQueue(player.userID))
+            // Handle active match (forfeit)
+            if (activeMatches.ContainsKey(player.userID))
+            {
+                var match = activeMatches[player.userID];
+                EndMatch(match, false, player.userID);
+                SendReply(player, "You forfeited the match.");
+                return;
+            }
+
+            // Try to leave old queue system
+            bool leftOldQueue = queueManager.LeaveQueue(player.userID);
+
+            // Try to leave Phase 3 queue system
+            bool inNewQueue = GetPlayerQueueType(player.userID).HasValue || GetPlayerCustomQueue(player.userID) != null;
+            LeaveQueueInternal(player, false);
+
+            if (leftOldQueue || inNewQueue)
             {
                 SendReply(player, "Left the queue.");
                 DestroyLeaveButton(player);
                 TeleportToLobby(player);
-                // ShowJoinButton(player); // Removed - lobby browser handles this
-                ShowLobbyBrowser(player); // Show lobby browser instead
+                ShowLobbyBrowser(player);
             }
             else
             {
-                SendReply(player, "You're not in queue.");
+                // Check if player is in a private room waiting queue
+                var roomID = GetPlayerRoom(player.userID);
+                if (roomID != null)
+                {
+                    LeaveRoom(player, roomID);
+                    TeleportToLobby(player);
+                    ShowLobbyBrowser(player);
+                }
+                else
+                {
+                    SendReply(player, "You're not in queue.");
+                }
             }
         }
         
@@ -662,10 +777,9 @@ namespace Oxide.Plugins
         private void ShowUICommand(BasePlayer player, string command, string[] args)
         {
             ShowLobbyBrowser(player); // Show lobby browser instead of old button
-            ShowLeaderboardUI(player);
             SendReply(player, "UI elements refreshed!");
             SendReply(player, "Lobby Browser: Right side");
-            SendReply(player, "Leaderboard: Top left");
+            SendReply(player, "Leaderboard: visible during active matches only");
             SendReply(player, "If you still don't see them, you may need to enable your cursor with F1 menu.");
         }
         
@@ -682,7 +796,13 @@ namespace Oxide.Plugins
                     continue;
                 
                 ShowLobbyBrowser(player); // Show lobby browser instead of old button
-                ShowLeaderboardUI(player);
+                
+                // Restore leave button for players waiting in a Phase 3 queue
+                if (GetPlayerQueueType(player.userID).HasValue || GetPlayerCustomQueue(player.userID) != null || queueManager.IsQueued(player.userID))
+                {
+                    ShowLeaveButton(player);
+                }
+                
                 refreshed++;
             }
             if (refreshed > 0)
@@ -714,6 +834,35 @@ namespace Oxide.Plugins
         {
             var cutoff = DateTime.Now.AddMinutes(-minutes);
             return data.StatEvents.Count(e => e.Type == "Loss" && e.Timestamp >= cutoff);
+        }
+        
+        private int GetRecentWinsByQueue(PlayerData data, string queueKey, int minutes)
+        {
+            var cutoff = DateTime.Now.AddMinutes(-minutes);
+            return data.StatEvents.Count(e => e.Type == "Win" && e.QueueKey == queueKey && e.Timestamp >= cutoff);
+        }
+        
+        private int GetRecentLossesByQueue(PlayerData data, string queueKey, int minutes)
+        {
+            var cutoff = DateTime.Now.AddMinutes(-minutes);
+            return data.StatEvents.Count(e => e.Type == "Loss" && e.QueueKey == queueKey && e.Timestamp >= cutoff);
+        }
+        
+        // Single-pass helper: returns win-rate percentage (0-100) for recent matches in queueKey.
+        // Used in both sort lambdas and display to avoid iterating StatEvents twice per comparison.
+        private float GetRecentWinRateByQueue(PlayerData data, string queueKey, int minutes)
+        {
+            var cutoff = DateTime.Now.AddMinutes(-minutes);
+            int wins = 0, losses = 0;
+            foreach (var e in data.StatEvents)
+            {
+                if (e.QueueKey == queueKey && e.Timestamp >= cutoff)
+                {
+                    if (e.Type == "Win")       wins++;
+                    else if (e.Type == "Loss") losses++;
+                }
+            }
+            return (wins + losses > 0) ? (100f * wins / (wins + losses)) : 0f;
         }
         
         // Cleanup old stat events to prevent data bloat
@@ -771,7 +920,7 @@ namespace Oxide.Plugins
             if (player == null) return;
             
             // Admin check
-            if (!player.IsAdmin)
+            if (!permission.UserHasPermission(player.UserIDString, "hellisplugin.admin"))
             {
                 SendReply(player, "You must be an admin to use this command.");
                 return;
@@ -793,6 +942,214 @@ namespace Oxide.Plugins
             
             Puts($"{player.displayName} cleared all leaderboard data ({count} players)");
             SendReply(player, $"✅ Leaderboard cleared! Removed {count} player records.");
+        }
+        
+        // Maximum character length for custom kit names.
+        private const int KitNameMaxLength = 20;
+        
+        // Minimum vertical anchor for the dynamically-sized gun select panel.
+        private const float GunSelectPanelMinBottom = 0.05f;
+        
+        // The 5 built-in kit names that map directly to DuelMode enum values.
+        private static readonly HashSet<string> BuiltInKitNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "AK47", "SAR", "Bow", "Revolver", "Speargun" };
+        
+        // Valid name characters for new custom kit names created with /kit save.
+        private static bool IsValidKitName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name) || name.Length > KitNameMaxLength) return false;
+            foreach (char c in name)
+                if (!char.IsLetterOrDigit(c) && c != '_' && c != '-') return false;
+            return true;
+        }
+        
+        [ChatCommand("kit")]
+        private void KitCommand(BasePlayer player, string command, string[] args)
+        {
+            if (player == null) return;
+            
+            if (!permission.UserHasPermission(player.UserIDString, "hellisplugin.admin"))
+            {
+                SendReply(player, "You must be an admin to use /kit.");
+                return;
+            }
+            
+            if (args == null || args.Length == 0)
+            {
+                SendReply(player, "Kit Commands (Admin):");
+                SendReply(player, "/kit list             - List all kit mode names");
+                SendReply(player, "/kit show <mode>      - Show items in a kit");
+                SendReply(player, "/kit save <mode>      - Save your inventory as the kit for <mode>");
+                SendReply(player, "/kit reset <mode>     - Reset a built-in kit to defaults");
+                SendReply(player, "/kit delete <mode>    - Delete a custom kit");
+                SendReply(player, "New custom names: letters/digits/underscore/dash, max 20 chars.");
+                return;
+            }
+            
+            string sub = args[0].ToLower();
+            
+            switch (sub)
+            {
+                case "list":
+                {
+                    if (config.Loadouts.Count == 0)
+                        SendReply(player, "No kits defined.");
+                    else
+                        SendReply(player, "Available kits: " + string.Join(", ", config.Loadouts.Keys));
+                    break;
+                }
+                
+                case "show":
+                {
+                    if (args.Length < 2)
+                    {
+                        SendReply(player, "Usage: /kit show <mode>  (e.g. /kit show AK47)");
+                        return;
+                    }
+                    // Case-insensitive match against config keys
+                    string modeName = config.Loadouts.Keys.FirstOrDefault(k =>
+                        string.Equals(k, args[1], StringComparison.OrdinalIgnoreCase));
+                    if (modeName == null)
+                    {
+                        SendReply(player, $"Unknown kit '{args[1]}'. Use /kit list to see available kits.");
+                        return;
+                    }
+                    if (config.Loadouts[modeName].Items.Count == 0)
+                    {
+                        SendReply(player, $"Kit '{modeName}' is empty.");
+                        return;
+                    }
+                    SendReply(player, $"=== Kit: {modeName} ===");
+                    foreach (var item in config.Loadouts[modeName].Items)
+                    {
+                        string skinPart = item.SkinID != 0 ? $" (skin {item.SkinID})" : "";
+                        SendReply(player, $"  {item.ShortName}  x{item.Amount}{skinPart}");
+                    }
+                    break;
+                }
+                
+                case "save":
+                {
+                    if (args.Length < 2)
+                    {
+                        SendReply(player, "Usage: /kit save <mode>  (e.g. /kit save Shotgun)");
+                        SendReply(player, "Equip yourself with the items you want, then run this command.");
+                        return;
+                    }
+                    string inputName = args[1];
+                    if (!IsValidKitName(inputName))
+                    {
+                        SendReply(player, "Invalid kit name. Use letters, digits, underscores or dashes (max 20 chars).");
+                        return;
+                    }
+                    // Preserve existing casing if the kit already exists, otherwise use as typed
+                    string modeName = config.Loadouts.Keys.FirstOrDefault(k =>
+                        string.Equals(k, inputName, StringComparison.OrdinalIgnoreCase)) ?? inputName;
+                    
+                    // Build the new loadout from the admin's current inventory
+                    // (main + belt + wear containers, deduplicated by shortname)
+                    var newItems = new List<LoadoutItemConfig>();
+                    var seen = new Dictionary<string, int>(); // shortname -> index in newItems
+                    
+                    var allContainers = new [] { player.inventory.containerMain, player.inventory.containerBelt, player.inventory.containerWear };
+                    foreach (var container in allContainers)
+                    {
+                        foreach (Item item in container.itemList)
+                        {
+                            if (item == null) continue;
+                            string sn = item.info.shortname;
+                            if (seen.ContainsKey(sn))
+                            {
+                                newItems[seen[sn]].Amount += item.amount;
+                            }
+                            else
+                            {
+                                seen[sn] = newItems.Count;
+                                newItems.Add(new LoadoutItemConfig
+                                {
+                                    ShortName = sn,
+                                    Amount    = item.amount,
+                                    SkinID    = item.skin
+                                });
+                            }
+                        }
+                    }
+                    
+                    if (newItems.Count == 0)
+                    {
+                        SendReply(player, "Your inventory is empty. Equip the items you want in the kit first.");
+                        return;
+                    }
+                    
+                    config.Loadouts[modeName] = new LoadoutConfig { Items = newItems };
+                    SaveConfig();
+                    loadoutManager.Reload(config);
+                    
+                    Puts($"{player.displayName} saved kit '{modeName}' ({newItems.Count} items)");
+                    SendReply(player, $"✅ Kit '{modeName}' saved with {newItems.Count} item(s). It now appears in the private room mode selector.");
+                    break;
+                }
+                
+                case "reset":
+                {
+                    if (args.Length < 2)
+                    {
+                        SendReply(player, "Usage: /kit reset <mode>  (e.g. /kit reset AK47)");
+                        SendReply(player, "Only the 5 built-in modes can be reset: AK47, SAR, Bow, Revolver, Speargun");
+                        return;
+                    }
+                    var defaults = Configuration.GetPublicDefaultLoadouts();
+                    string modeName = defaults.Keys.FirstOrDefault(k =>
+                        string.Equals(k, args[1], StringComparison.OrdinalIgnoreCase));
+                    if (modeName == null)
+                    {
+                        SendReply(player, $"No built-in default exists for '{args[1]}'. Built-in modes: AK47, SAR, Bow, Revolver, Speargun");
+                        return;
+                    }
+                    
+                    config.Loadouts[modeName] = defaults[modeName];
+                    SaveConfig();
+                    loadoutManager.Reload(config);
+                    
+                    Puts($"{player.displayName} reset kit '{modeName}' to defaults");
+                    SendReply(player, $"✅ Kit '{modeName}' reset to built-in defaults.");
+                    break;
+                }
+                
+                case "delete":
+                {
+                    if (args.Length < 2)
+                    {
+                        SendReply(player, "Usage: /kit delete <mode>  (e.g. /kit delete Shotgun)");
+                        SendReply(player, "The 5 built-in kits cannot be deleted, only custom ones.");
+                        return;
+                    }
+                    if (BuiltInKitNames.Contains(args[1]))
+                    {
+                        SendReply(player, $"Cannot delete built-in kit '{args[1]}'. Use /kit reset to restore defaults.");
+                        return;
+                    }
+                    string modeName = config.Loadouts.Keys.FirstOrDefault(k =>
+                        string.Equals(k, args[1], StringComparison.OrdinalIgnoreCase));
+                    if (modeName == null)
+                    {
+                        SendReply(player, $"Kit '{args[1]}' does not exist.");
+                        return;
+                    }
+                    
+                    config.Loadouts.Remove(modeName);
+                    SaveConfig();
+                    loadoutManager.Reload(config);
+                    
+                    Puts($"{player.displayName} deleted kit '{modeName}'");
+                    SendReply(player, $"✅ Kit '{modeName}' deleted.");
+                    break;
+                }
+                
+                default:
+                    SendReply(player, $"Unknown sub-command '{args[0]}'. Use /kit for help.");
+                    break;
+            }
         }
         
         [ChatCommand("help")]
@@ -827,9 +1184,18 @@ namespace Oxide.Plugins
                 SendReply(player, "/arena list - List all arenas");
                 SendReply(player, "/arena delete <name> - Delete arena");
                 SendReply(player, "/arena setradius <name> <radius> - Set arena zone radius");
+                SendReply(player, "/arena setkit <name> <kit> - Set arena kit (replaces pool)");
+                SendReply(player, "/arena addkit <name> <kit> - Add kit to random pool");
+                SendReply(player, "/arena removekit <name> <kit> - Remove kit from pool");
+                SendReply(player, "/arena clearkit <name> - Remove all kit overrides");
                 SendReply(player, "/lobby setpos - Set lobby position");
                 SendReply(player, "/lobby setradius <radius> - Set lobby zone radius");
                 SendReply(player, "/clearleaderboard - Clear all leaderboard data (requires confirm)");
+                SendReply(player, "/kit save <mode>      - Save your inventory as a kit (any name)");
+                SendReply(player, "/kit show <mode>      - Show items in a kit");
+                SendReply(player, "/kit list             - List all kit names");
+                SendReply(player, "/kit reset <mode>     - Reset a built-in kit to defaults");
+                SendReply(player, "/kit delete <mode>    - Delete a custom kit");
                 SendReply(player, "");
             }
             
@@ -872,8 +1238,81 @@ namespace Oxide.Plugins
             {
                 case "setpos":
                     arenaManager.SetLobby(player.transform.position, arenaManager.GetLobbyRadius());
-                    SaveArenas();
-                    SendReply(player, $"Lobby position set to: {player.transform.position}");
+                    SaveLobbyData();
+                    SendReply(player, $"Lobby spawn 1 set to: {player.transform.position}\nUse /lobby addspawn to add more spawn points.");
+                    break;
+                    
+                case "addspawn":
+                    arenaManager.AddLobbySpawn(player.transform.position);
+                    SaveLobbyData();
+                    int spawnCount = arenaManager.GetLobbySpawnPoints().Count;
+                    SendReply(player, $"Lobby spawn point {spawnCount} added at: {player.transform.position}");
+                    break;
+                    
+                case "removespawn":
+                    if (args.Length < 2)
+                    {
+                        SendReply(player, $"Usage: /lobby removespawn <number>\nUse /lobby listspawns to see spawn numbers.");
+                        return;
+                    }
+                    int removeIndex;
+                    if (int.TryParse(args[1], out removeIndex) && removeIndex >= 1)
+                    {
+                        if (arenaManager.RemoveLobbySpawn(removeIndex - 1))
+                        {
+                            SaveLobbyData();
+                            SendReply(player, $"Lobby spawn point {removeIndex} removed. Remaining: {arenaManager.GetLobbySpawnPoints().Count}");
+                        }
+                        else
+                        {
+                            SendReply(player, $"Invalid spawn number. Use /lobby listspawns to see valid numbers.");
+                        }
+                    }
+                    else
+                    {
+                        SendReply(player, "Invalid number. Usage: /lobby removespawn <number>");
+                    }
+                    break;
+                    
+                case "listspawns":
+                    var spawnPoints = arenaManager.GetLobbySpawnPoints();
+                    if (spawnPoints.Count == 0)
+                    {
+                        SendReply(player, "No lobby spawn points set. Use /lobby setpos or /lobby addspawn.");
+                    }
+                    else
+                    {
+                        var sb = new System.Text.StringBuilder();
+                        sb.AppendLine($"Lobby spawn points ({spawnPoints.Count} total):");
+                        for (int i = 0; i < spawnPoints.Count; i++)
+                            sb.AppendLine($"  {i + 1}: {spawnPoints[i]}");
+                        sb.AppendLine($"Zone radius: {arenaManager.GetLobbyRadius()}m");
+                        SendReply(player, sb.ToString().TrimEnd());
+                        ShowLobbySpawnVisuals(player);
+                    }
+                    break;
+                    
+                case "editspawn":
+                    if (args.Length < 2)
+                    {
+                        SendReply(player, $"Usage: /lobby editspawn <number>\nUse /lobby listspawns to see spawn numbers.");
+                        return;
+                    }
+                    int editIndex;
+                    int editTotal = arenaManager.GetLobbySpawnPoints().Count;
+                    if (int.TryParse(args[1], out editIndex) && editIndex >= 1 && editIndex <= editTotal)
+                    {
+                        arenaManager.EditLobbySpawn(editIndex - 1, player.transform.position);
+                        SaveLobbyData();
+                        SendReply(player, $"Lobby spawn point {editIndex} updated to: {player.transform.position}");
+                        ShowLobbySpawnVisuals(player);
+                    }
+                    else
+                    {
+                        SendReply(player, editTotal == 0
+                            ? "No spawn points set yet. Use /lobby setpos or /lobby addspawn first."
+                            : $"Invalid number. Must be 1–{editTotal}. Use /lobby listspawns to see them.");
+                    }
                     break;
                     
                 case "setradius":
@@ -886,8 +1325,8 @@ namespace Oxide.Plugins
                     float lobbyRadius;
                     if (float.TryParse(args[1], out lobbyRadius) && lobbyRadius > 0)
                     {
-                        arenaManager.SetLobby(arenaManager.GetLobbyPosition(), lobbyRadius);
-                        SaveArenas();
+                        arenaManager.SetLobbyRadius(lobbyRadius);
+                        SaveLobbyData();
                         SendReply(player, $"Lobby radius set to: {lobbyRadius}m");
                     }
                     else
@@ -899,7 +1338,11 @@ namespace Oxide.Plugins
                 default:
                     SendReply(player, "Lobby Commands:\n" +
                                      "/lobby - Teleport to lobby\n" +
-                                     "/lobby setpos - Set lobby position (Admin)\n" +
+                                     "/lobby setpos - Set (or replace) spawn point 1\n" +
+                                     "/lobby addspawn - Add another spawn point at your position\n" +
+                                     "/lobby editspawn <n> - Move spawn point n to your position\n" +
+                                     "/lobby removespawn <n> - Remove spawn point by number\n" +
+                                     "/lobby listspawns - List all spawn points (shows DDraw markers)\n" +
                                      "/lobby setradius <radius> - Set lobby zone radius (Admin)");
                     break;
             }
@@ -918,13 +1361,21 @@ namespace Oxide.Plugins
             {
                 SendReply(player, "Arena Commands:\n" +
                                  "/arena create <name> - Start creating a new arena\n" +
+                                 "/arena edit <name> - Edit an existing arena (shows zone & spawns)\n" +
                                  "/arena setspawn1 - Set first spawn point\n" +
                                  "/arena setspawn2 - Set second spawn point\n" +
+                                 "/arena setradius <radius> - Set zone radius during create/edit (default: 30m)\n" +
+                                 "/arena setlobbyspawn - Set per-arena lobby spawn during create/edit\n" +
+                                 "/arena setlobbyradius <radius> - Set lobby zone radius during create/edit (default: 10m)\n" +
                                  "/arena save - Save the arena\n" +
-                                 "/arena cancel - Cancel arena creation\n" +
+                                 "/arena cancel - Cancel arena creation/editing\n" +
                                  "/arena list - List all arenas\n" +
                                  "/arena delete <name> - Delete an arena\n" +
-                                 "/arena setradius <name> <radius> - Set arena zone radius\n" +
+                                 "/arena setradius <name> <radius> - Change radius of a saved arena\n" +
+                                 "/arena setkit <name> <kitName> - Set arena kit (replaces pool)\n" +
+                                 "/arena addkit <name> <kitName> - Add kit to random pool\n" +
+                                 "/arena removekit <name> <kitName> - Remove kit from pool\n" +
+                                 "/arena clearkit <name> - Remove all kit overrides\n" +
                                  "/arena tp <name> [1|2] - Teleport to arena spawn");
                 return;
             }
@@ -940,12 +1391,34 @@ namespace Oxide.Plugins
                     CreateArena(player, string.Join(" ", args.Skip(1)));
                     break;
                     
+                case "edit":
+                    if (args.Length < 2)
+                    {
+                        SendReply(player, "Usage: /arena edit <name>");
+                        return;
+                    }
+                    EditArena(player, string.Join(" ", args.Skip(1)));
+                    break;
+                    
                 case "setspawn1":
                     SetSpawn1(player);
                     break;
                     
                 case "setspawn2":
                     SetSpawn2(player);
+                    break;
+                    
+                case "setlobbyspawn":
+                    SetLobbySpawn(player);
+                    break;
+                    
+                case "setlobbyradius":
+                    if (args.Length < 2)
+                    {
+                        SendReply(player, "Usage: /arena setlobbyradius <radius>");
+                        return;
+                    }
+                    SetLobbyRadius(player, args[1]);
                     break;
                     
                 case "save":
@@ -991,9 +1464,29 @@ namespace Oxide.Plugins
                     break;
                     
                 case "setradius":
+                    // During an active creation session: /arena setradius <radius>
+                    if (args.Length == 2 && arenaBuilders.ContainsKey(player.userID))
+                    {
+                        float newRadius;
+                        if (!float.TryParse(args[1], out newRadius) || newRadius <= 0)
+                        {
+                            SendReply(player, "Invalid radius. Please enter a positive number.");
+                            return;
+                        }
+                        var builderForRadius = arenaBuilders[player.userID];
+                        builderForRadius.Radius = newRadius;
+                        SendReply(player, $"Arena radius set to {newRadius}m. Zone preview updated.");
+                        // Restart visualization to immediately reflect the new radius
+                        if (builderForRadius.Spawn1 != Vector3.zero)
+                            StartBuilderVisualization(player, builderForRadius);
+                        return;
+                    }
+                    
+                    // Saved arena: /arena setradius <name> <radius>
                     if (args.Length < 3)
                     {
-                        SendReply(player, "Usage: /arena setradius <name> <radius>");
+                        SendReply(player, "Usage: /arena setradius <radius>  (during creation)\n" +
+                                         "       /arena setradius <name> <radius>  (saved arena)");
                         return;
                     }
                     
@@ -1017,6 +1510,137 @@ namespace Oxide.Plugins
                     SaveArenas();
                     SendReply(player, $"Arena '{arenaNameForRadius}' radius set to: {arenaRadius}m");
                     break;
+                    
+                case "setkit":
+                {
+                    if (args.Length < 3)
+                    {
+                        SendReply(player, "Usage: /arena setkit <arenaName> <kitName>");
+                        return;
+                    }
+                    // Last arg is the kit name; args[1] through args[Length-2] form the arena name.
+                    string kitName = args[args.Length - 1];
+                    string arenaNameForKit = string.Join(" ", args.Skip(1).Take(args.Length - 2));
+                    
+                    // Validate kit exists
+                    string resolvedKit = config.Loadouts.Keys.FirstOrDefault(k =>
+                        string.Equals(k, kitName, StringComparison.OrdinalIgnoreCase));
+                    if (resolvedKit == null)
+                    {
+                        SendReply(player, $"Unknown kit '{kitName}'. Use /kit list to see available kits.");
+                        return;
+                    }
+                    
+                    // Update ArenaConfig (data file) and live Arena object
+                    var arenaConfigForKit = arenas.FirstOrDefault(a =>
+                        a.Name.Equals(arenaNameForKit, StringComparison.OrdinalIgnoreCase));
+                    if (arenaConfigForKit == null)
+                    {
+                        SendReply(player, $"Arena '{arenaNameForKit}' not found.");
+                        return;
+                    }
+                    arenaConfigForKit.KitOverrides = new List<string> { resolvedKit };
+                    SaveArenas();
+                    arenaManager.SetArenaKitOverrides(arenaNameForKit, arenaConfigForKit.KitOverrides);
+                    SendReply(player, $"Arena '{arenaConfigForKit.Name}' kit pool set to: [{resolvedKit}]. Use /arena addkit to add more.");
+                    break;
+                }
+                    
+                case "addkit":
+                {
+                    if (args.Length < 3)
+                    {
+                        SendReply(player, "Usage: /arena addkit <arenaName> <kitName>");
+                        return;
+                    }
+                    // Last arg is the kit name; args[1] through args[Length-2] form the arena name.
+                    string kitName = args[args.Length - 1];
+                    string arenaNameForAddKit = string.Join(" ", args.Skip(1).Take(args.Length - 2));
+                    
+                    string resolvedAddKit = config.Loadouts.Keys.FirstOrDefault(k =>
+                        string.Equals(k, kitName, StringComparison.OrdinalIgnoreCase));
+                    if (resolvedAddKit == null)
+                    {
+                        SendReply(player, $"Unknown kit '{kitName}'. Use /kit list to see available kits.");
+                        return;
+                    }
+                    
+                    var arenaConfigForAddKit = arenas.FirstOrDefault(a =>
+                        a.Name.Equals(arenaNameForAddKit, StringComparison.OrdinalIgnoreCase));
+                    if (arenaConfigForAddKit == null)
+                    {
+                        SendReply(player, $"Arena '{arenaNameForAddKit}' not found.");
+                        return;
+                    }
+                    if (arenaConfigForAddKit.KitOverrides.Contains(resolvedAddKit))
+                    {
+                        SendReply(player, $"Kit '{resolvedAddKit}' is already in arena '{arenaConfigForAddKit.Name}' kit list.");
+                        return;
+                    }
+                    arenaConfigForAddKit.KitOverrides.Add(resolvedAddKit);
+                    SaveArenas();
+                    arenaManager.SetArenaKitOverrides(arenaNameForAddKit, arenaConfigForAddKit.KitOverrides);
+                    SendReply(player, $"Kit '{resolvedAddKit}' added to arena '{arenaConfigForAddKit.Name}'. " +
+                                     $"Kit list: {string.Join(", ", arenaConfigForAddKit.KitOverrides)}");
+                    break;
+                }
+                    
+                case "removekit":
+                {
+                    if (args.Length < 3)
+                    {
+                        SendReply(player, "Usage: /arena removekit <arenaName> <kitName>");
+                        return;
+                    }
+                    string kitName = args[args.Length - 1];
+                    string arenaNameForRemoveKit = string.Join(" ", args.Skip(1).Take(args.Length - 2));
+                    
+                    var arenaConfigForRemoveKit = arenas.FirstOrDefault(a =>
+                        a.Name.Equals(arenaNameForRemoveKit, StringComparison.OrdinalIgnoreCase));
+                    if (arenaConfigForRemoveKit == null)
+                    {
+                        SendReply(player, $"Arena '{arenaNameForRemoveKit}' not found.");
+                        return;
+                    }
+                    // Case-insensitive removal
+                    string existing = arenaConfigForRemoveKit.KitOverrides?.FirstOrDefault(k =>
+                        string.Equals(k, kitName, StringComparison.OrdinalIgnoreCase));
+                    if (existing == null)
+                    {
+                        SendReply(player, $"Kit '{kitName}' is not in arena '{arenaConfigForRemoveKit.Name}' kit list.");
+                        return;
+                    }
+                    arenaConfigForRemoveKit.KitOverrides.Remove(existing);
+                    SaveArenas();
+                    arenaManager.SetArenaKitOverrides(arenaNameForRemoveKit, arenaConfigForRemoveKit.KitOverrides);
+                    string remaining = arenaConfigForRemoveKit.KitOverrides.Count > 0
+                        ? string.Join(", ", arenaConfigForRemoveKit.KitOverrides)
+                        : "(none - uses mode-based kit)";
+                    SendReply(player, $"Kit '{existing}' removed from arena '{arenaConfigForRemoveKit.Name}'. Remaining: {remaining}");
+                    break;
+                }
+                    
+                case "clearkit":
+                {
+                    if (args.Length < 2)
+                    {
+                        SendReply(player, "Usage: /arena clearkit <arenaName>");
+                        return;
+                    }
+                    string arenaNameToClear = string.Join(" ", args.Skip(1));
+                    var arenaConfigToClear = arenas.FirstOrDefault(a =>
+                        a.Name.Equals(arenaNameToClear, StringComparison.OrdinalIgnoreCase));
+                    if (arenaConfigToClear == null)
+                    {
+                        SendReply(player, $"Arena '{arenaNameToClear}' not found.");
+                        return;
+                    }
+                    arenaConfigToClear.KitOverrides = new List<string>();
+                    SaveArenas();
+                    arenaManager.SetArenaKitOverrides(arenaNameToClear, new List<string>());
+                    SendReply(player, $"Arena '{arenaConfigToClear.Name}' kit overrides cleared (uses mode-based kit).");
+                    break;
+                }
                     
                 default:
                     SendReply(player, "Unknown command. Use /arena for help.");
@@ -1047,15 +1671,34 @@ namespace Oxide.Plugins
             ProcessAllQueues();
         }
         
-        private void StartDuel(BasePlayer player1, BasePlayer player2, DuelMode mode)
+        private void StartDuel(BasePlayer player1, BasePlayer player2, DuelMode mode, string roomID = null, QueueType? sourceQueueType = null, string customModeName = null)
         {
             var arena = arenaManager.GetAvailableArena();
             if (arena == null)
             {
                 SendReply(player1, "No arenas available. Please wait.");
                 SendReply(player2, "No arenas available. Please wait.");
-                queueManager.JoinQueue(player1.userID, player1.displayName, mode);
-                queueManager.JoinQueue(player2.userID, player2.displayName, mode);
+                if (roomID != null && privateRooms.ContainsKey(roomID))
+                {
+                    // Re-add to room waiting queue on failure
+                    privateRooms[roomID].WaitingQueue.Add(player1.userID);
+                    privateRooms[roomID].WaitingQueue.Add(player2.userID);
+                }
+                else if (sourceQueueType.HasValue)
+                {
+                    JoinQueueByType(player1, sourceQueueType.Value);
+                    JoinQueueByType(player2, sourceQueueType.Value);
+                }
+                else if (mode == DuelMode.Custom && customModeName != null && customQueuesByName.ContainsKey(customModeName))
+                {
+                    JoinCustomQueue(player1, customModeName);
+                    JoinCustomQueue(player2, customModeName);
+                }
+                else
+                {
+                    queueManager.JoinQueue(player1.userID, player1.displayName, mode);
+                    queueManager.JoinQueue(player2.userID, player2.displayName, mode);
+                }
                 return;
             }
             
@@ -1065,14 +1708,45 @@ namespace Oxide.Plugins
             {
                 SendReply(player1, "No arena instances available. Please wait.");
                 SendReply(player2, "No arena instances available. Please wait.");
-                queueManager.JoinQueue(player1.userID, player1.displayName, mode);
-                queueManager.JoinQueue(player2.userID, player2.displayName, mode);
+                if (roomID != null && privateRooms.ContainsKey(roomID))
+                {
+                    privateRooms[roomID].WaitingQueue.Add(player1.userID);
+                    privateRooms[roomID].WaitingQueue.Add(player2.userID);
+                }
+                else if (sourceQueueType.HasValue)
+                {
+                    JoinQueueByType(player1, sourceQueueType.Value);
+                    JoinQueueByType(player2, sourceQueueType.Value);
+                }
+                else if (mode == DuelMode.Custom && customModeName != null && customQueuesByName.ContainsKey(customModeName))
+                {
+                    JoinCustomQueue(player1, customModeName);
+                    JoinCustomQueue(player2, customModeName);
+                }
+                else
+                {
+                    queueManager.JoinQueue(player1.userID, player1.displayName, mode);
+                    queueManager.JoinQueue(player2.userID, player2.displayName, mode);
+                }
                 return;
             }
             
             var match = new ActiveMatch(player1.userID, player2.userID, mode, arena, instanceId, config.BestOfRounds);
+            match.RoomID = roomID;
+            match.SourceQueueType = sourceQueueType;
+            match.CustomModeName = customModeName;
+            // Pick the kit once for the whole match so both players and all rounds share the same kit.
+            match.ResolvedArenaKit = arena.PickRandomKitOverride();
             activeMatches[player1.userID] = match;
             activeMatches[player2.userID] = match;
+            
+            // Force network re-evaluation for the two newly matched players so CanNetworkTo
+            // immediately hides them from lobby players and from players in other concurrent
+            // matches sharing the same arena. Sending the update for each player causes the
+            // server to re-check CanNetworkTo for every client, which drops visibility for
+            // clients that are no longer permitted to see these players.
+            player1.SendNetworkUpdateImmediate();
+            player2.SendNetworkUpdateImmediate();
             
             // Clean up any arrows from previous matches
             var arrows1 = new List<BaseEntity>();
@@ -1096,14 +1770,22 @@ namespace Oxide.Plugins
             TeleportPlayer(player2, arena.Spawn2);
             
             // Apply loadouts
-            GiveLoadout(player1, mode);
-            GiveLoadout(player2, mode);
+            GiveLoadout(player1, mode, customModeName, match.ResolvedArenaKit);
+            GiveLoadout(player2, mode, customModeName, match.ResolvedArenaKit);
             
-            // Hide join button and show leave button during match
+            // Hide lobby UI and join button during match; show leave button
+            DestroyLobbyBrowser(player1);
+            DestroyLobbyBrowser(player2);
             DestroyJoinButton(player1);
             DestroyJoinButton(player2);
+            DestroyLeaveButton(player1);
+            DestroyLeaveButton(player2);
             ShowLeaveButton(player1);
             ShowLeaveButton(player2);
+            
+            // Immediately show leaderboard scoped to this match's queue
+            ShowLeaderboardUI(player1);
+            ShowLeaderboardUI(player2);
             
             // Start countdown (silent - no chat messages)
             timer.Once(config.CountdownDuration, () => StartRound(match));
@@ -1140,27 +1822,31 @@ namespace Oxide.Plugins
             }
             else if (match.IsRoundFinished())
             {
-                // Start next round - reset both players without death/respawn
+                // Reset both players first so round progression is never blocked by cleanup.
                 var player1 = BasePlayer.FindByID(match.Player1ID);
                 var player2 = BasePlayer.FindByID(match.Player2ID);
                 
                 if (player1 != null)
                 {
                     SendReply(player1, $"Round {match.CurrentRound}/{match.BestOfRounds} - Score: {match.Player1Score}-{match.Player2Score}");
-                    ResetPlayerForNextRound(player1, match.Arena.Spawn1, match.Mode);
+                    ResetPlayerForNextRound(player1, match.Arena.Spawn1, match.Mode, match.CustomModeName, match.ResolvedArenaKit);
                 }
                 
                 if (player2 != null)
                 {
                     SendReply(player2, $"Round {match.CurrentRound}/{match.BestOfRounds} - Score: {match.Player1Score}-{match.Player2Score}");
-                    ResetPlayerForNextRound(player2, match.Arena.Spawn2, match.Mode);
+                    ResetPlayerForNextRound(player2, match.Arena.Spawn2, match.Mode, match.CustomModeName, match.ResolvedArenaKit);
                 }
+                
+                // Clean up anything players built/deployed during the previous round.
+                // Done after player resets so cleanup failures cannot block round progression.
+                KillMatchEntities(match);
                 
                 timer.Once(config.CountdownDuration, () => StartRound(match));
             }
         }
         
-        private void ResetPlayerForNextRound(BasePlayer player, Vector3 spawnPos, DuelMode mode)
+        private void ResetPlayerForNextRound(BasePlayer player, Vector3 spawnPos, DuelMode mode, string customModeName = null, string arenaKitOverride = null)
         {
             if (player == null || !player.IsConnected) return;
             
@@ -1176,7 +1862,7 @@ namespace Oxide.Plugins
             
             // Clear and give fresh loadout
             player.inventory.Strip();
-            GiveLoadout(player, mode);
+            GiveLoadout(player, mode, customModeName, arenaKitOverride);
             
             // Reset metabolism
             player.metabolism.Reset();
@@ -1197,6 +1883,9 @@ namespace Oxide.Plugins
             UpdatePlayerStats(match.Player1ID, winnerID == match.Player1ID, match);
             UpdatePlayerStats(match.Player2ID, winnerID == match.Player2ID, match);
             
+            // Capture room context before removing from active matches
+            string matchRoomID = match.RoomID;
+            
             // Notify players
             if (player1 != null)
             {
@@ -1214,13 +1903,37 @@ namespace Oxide.Plugins
                     ShowWinLoseUI(player1, player1Won, match.Player1Score, match.Player2Score);
                 }
                 
-                // Return to spawn or re-queue
+                // Return to spawn
                 ReturnPlayerToLobby(player1);
                 
-                if (config.AutoRequeue && !disconnect && !autoRequeueOptOut.Contains(player1.userID))
+                // For room matches, re-add to room waiting queue; otherwise standard auto-requeue
+                if (matchRoomID != null && privateRooms.ContainsKey(matchRoomID))
                 {
-                    queueManager.JoinQueue(player1.userID, player1.displayName, DuelMode.Any);
-                    SendReply(player1, "✓ Auto-requeued for random match!");
+                    var room = privateRooms[matchRoomID];
+                    if (room.PlayerIDs.Contains(match.Player1ID))
+                    {
+                        room.WaitingQueue.Add(match.Player1ID);
+                        SendReply(player1, $"Back in {room.RoomName}'s room queue. Waiting for next match...");
+                    }
+                }
+                else if (config.AutoRequeue && !disconnect && !autoRequeueOptOut.Contains(player1.userID))
+                {
+                    if (IsCustomPublicQueueMatch(match))
+                    {
+                        // Custom public-queue match — re-add to custom queue
+                        if (customQueuesByName.ContainsKey(match.CustomModeName) && !customQueuesByName[match.CustomModeName].Contains(player1.userID))
+                            customQueuesByName[match.CustomModeName].Add(player1.userID);
+                        SendReply(player1, $"Auto-requeued for {match.CustomModeName} match!");
+                    }
+                    else
+                    {
+                        var targetQueue = match.SourceQueueType ?? QueueType.Public;
+                        if (!queuesByType.ContainsKey(targetQueue))
+                            queuesByType[targetQueue] = new List<ulong>();
+                        if (!queuesByType[targetQueue].Contains(player1.userID))
+                            queuesByType[targetQueue].Add(player1.userID);
+                        SendReply(player1, $"Auto-requeued for {GetQueueLabel(targetQueue)} match!");
+                    }
                 }
                 else if (config.AutoRequeue && autoRequeueOptOut.Contains(player1.userID))
                 {
@@ -1246,10 +1959,32 @@ namespace Oxide.Plugins
                 
                 ReturnPlayerToLobby(player2);
                 
-                if (config.AutoRequeue && !disconnect && !autoRequeueOptOut.Contains(player2.userID))
+                if (matchRoomID != null && privateRooms.ContainsKey(matchRoomID))
                 {
-                    queueManager.JoinQueue(player2.userID, player2.displayName, DuelMode.Any);
-                    SendReply(player2, "✓ Auto-requeued for random match!");
+                    var room = privateRooms[matchRoomID];
+                    if (room.PlayerIDs.Contains(match.Player2ID))
+                    {
+                        room.WaitingQueue.Add(match.Player2ID);
+                        SendReply(player2, $"Back in {room.RoomName}'s room queue. Waiting for next match...");
+                    }
+                }
+                else if (config.AutoRequeue && !disconnect && !autoRequeueOptOut.Contains(player2.userID))
+                {
+                    if (IsCustomPublicQueueMatch(match))
+                    {
+                        if (customQueuesByName.ContainsKey(match.CustomModeName) && !customQueuesByName[match.CustomModeName].Contains(player2.userID))
+                            customQueuesByName[match.CustomModeName].Add(player2.userID);
+                        SendReply(player2, $"Auto-requeued for {match.CustomModeName} match!");
+                    }
+                    else
+                    {
+                        var targetQueue = match.SourceQueueType ?? QueueType.Public;
+                        if (!queuesByType.ContainsKey(targetQueue))
+                            queuesByType[targetQueue] = new List<ulong>();
+                        if (!queuesByType[targetQueue].Contains(player2.userID))
+                            queuesByType[targetQueue].Add(player2.userID);
+                        SendReply(player2, $"Auto-requeued for {GetQueueLabel(targetQueue)} match!");
+                    }
                 }
                 else if (config.AutoRequeue && autoRequeueOptOut.Contains(player2.userID))
                 {
@@ -1260,22 +1995,57 @@ namespace Oxide.Plugins
             // Release arena instance
             arenaManager.ReleaseArenaInstance(match.Arena, match.InstanceID);
             
+            // Kill any walls/deployables placed during this match before returning players.
+            KillMatchEntities(match);
+            
             // Remove from active matches
             activeMatches.Remove(match.Player1ID);
             activeMatches.Remove(match.Player2ID);
             
-            // Refresh UI for both players
-            timer.Once(0.5f, () =>
+            // Now that both players are removed from activeMatches they are lobby players again.
+            // ReturnPlayerToLobby called HidePlayerInLobby but skipped the former opponent
+            // because that player was still in activeMatches at that point.  Now that both
+            // entries have been removed we can properly hide each from the other.
+            if (player1 != null && player1.IsConnected) HidePlayerInLobby(player1);
+            if (player2 != null && player2.IsConnected) HidePlayerInLobby(player2);
+            
+            // For room matches, try to start the next match from the waiting queue
+            if (matchRoomID != null && privateRooms.ContainsKey(matchRoomID))
             {
-                if (player1 != null && player1.IsConnected)
+                timer.Once(1.5f, () => TryRoomMatchmaking(matchRoomID));
+            }
+            
+            // Refresh UI for both players — delay until after the 2 s WinLose overlay has dismissed
+            timer.Once(2.5f, () =>
+            {
+                if (player1 != null && player1.IsConnected && !activeMatches.ContainsKey(player1.userID))
                 {
                     DestroyLeaveButton(player1);
-                    ShowLobbyBrowser(player1); // Show lobby browser instead
+                    DestroyLeaderboardUI(player1); // Hide leaderboard when returning to lobby
+                    ShowLobbyBrowser(player1);
+                    if (GetPlayerQueueType(player1.userID).HasValue)
+                        ShowLeaveButton(player1);
+                    // Show pending join requests to room owner after match
+                    var ownedRoomID = GetOwnedRoom(player1.userID);
+                    if (ownedRoomID != null && privateRooms.ContainsKey(ownedRoomID) &&
+                        privateRooms[ownedRoomID].PendingRequests.Count > 0)
+                    {
+                        ShowJoinRequestUI(player1, ownedRoomID);
+                    }
                 }
-                if (player2 != null && player2.IsConnected)
+                if (player2 != null && player2.IsConnected && !activeMatches.ContainsKey(player2.userID))
                 {
                     DestroyLeaveButton(player2);
-                    ShowLobbyBrowser(player2); // Show lobby browser instead
+                    DestroyLeaderboardUI(player2); // Hide leaderboard when returning to lobby
+                    ShowLobbyBrowser(player2);
+                    if (GetPlayerQueueType(player2.userID).HasValue)
+                        ShowLeaveButton(player2);
+                    var ownedRoomID = GetOwnedRoom(player2.userID);
+                    if (ownedRoomID != null && privateRooms.ContainsKey(ownedRoomID) &&
+                        privateRooms[ownedRoomID].PendingRequests.Count > 0)
+                    {
+                        ShowJoinRequestUI(player2, ownedRoomID);
+                    }
                 }
             });
             
@@ -1307,6 +2077,56 @@ namespace Oxide.Plugins
         #endregion
         
         #region Helpers
+        
+        // Sends an explicit EntityDestroy packet to the viewer's client.
+        // CanNetworkTo returning false only blocks future network updates; it does NOT remove
+        // entities already present on a client, causing the "frozen model" visual bug.
+        // This method removes the entity immediately, solving the frozen-model problem.
+        private void ForceHideEntityFromPlayer(BaseNetworkable entity, BasePlayer viewer)
+        {
+            if (entity?.net == null || viewer?.Connection == null) return;
+            Net.sv.write.Start();
+            Net.sv.write.PacketID(Message.Type.EntityDestroy);
+            Net.sv.write.EntityID(entity.net.ID);
+            Net.sv.write.UInt8(0); // 0 = remove/destroy
+            Net.sv.write.Send(new SendInfo(viewer.Connection));
+        }
+        
+        // Hides arrivingPlayer (and their held item) from every non-match lobby player,
+        // and hides every non-match lobby player from arrivingPlayer.
+        // Call this whenever a player enters the lobby or returns from a match.
+        // Combined with CanNetworkTo returning false, this fully eliminates frozen models.
+        private void HidePlayerInLobby(BasePlayer arrivingPlayer)
+        {
+            if (arrivingPlayer == null) return;
+            var heldItem = arrivingPlayer.GetHeldEntity();
+            foreach (var other in BasePlayer.activePlayerList)
+            {
+                if (other == null || !other.IsConnected || other == arrivingPlayer) continue;
+                if (activeMatches.ContainsKey(other.userID)) continue;
+                
+                // Hide arrivingPlayer (and their held item) from other
+                ForceHideEntityFromPlayer(arrivingPlayer, other);
+                if (heldItem != null) ForceHideEntityFromPlayer(heldItem, other);
+                
+                // Hide other (and their held item) from arrivingPlayer
+                ForceHideEntityFromPlayer(other, arrivingPlayer);
+                var otherHeld = other.GetHeldEntity();
+                if (otherHeld != null) ForceHideEntityFromPlayer(otherHeld, arrivingPlayer);
+            }
+        }
+        
+        // Kills all entities placed during the given match (walls, deployables, etc.)
+        // and clears the tracking list.  Call between rounds and on match end.
+        private void KillMatchEntities(ActiveMatch match)
+        {
+            foreach (var ent in match.SpawnedEntities)
+            {
+                if (ent != null && !ent.IsDestroyed)
+                    ent.Kill();
+            }
+            match.SpawnedEntities.Clear();
+        }
         
         private void TeleportPlayer(BasePlayer player, Vector3 position)
         {
@@ -1352,7 +2172,7 @@ namespace Oxide.Plugins
             // Teleport to lobby if configured, otherwise use default spawn
             if (arenaManager.IsLobbySet())
             {
-                player.Teleport(arenaManager.GetLobbyPosition());
+                player.Teleport(arenaManager.GetRandomLobbySpawn());
             }
             else
             {
@@ -1363,9 +2183,15 @@ namespace Oxide.Plugins
                     player.Teleport(spawnPoint.pos);
                 }
             }
+            
+            // Hide this returning player from all lobby bystanders and vice versa.
+            // Note: if this player's former match opponent is still in activeMatches at this
+            // point, HidePlayerInLobby will skip them; EndMatch calls HidePlayerInLobby again
+            // after activeMatches.Remove to handle the former-opponent pair correctly.
+            HidePlayerInLobby(player);
         }
         
-        private void GiveLoadout(BasePlayer player, DuelMode mode)
+        private void GiveLoadout(BasePlayer player, DuelMode mode, string customModeName = null, string arenaKitOverride = null)
         {
             if (player == null) return;
             
@@ -1374,7 +2200,14 @@ namespace Oxide.Plugins
             player.metabolism.hydration.value = 250;
             player.health = 100;
             
-            var loadout = loadoutManager.GetLoadout(mode);
+            // Priority: arena kit override > custom mode name > mode-based loadout
+            Loadout loadout;
+            if (arenaKitOverride != null)
+                loadout = loadoutManager.GetLoadoutByName(arenaKitOverride);
+            else if (mode == DuelMode.Custom && customModeName != null)
+                loadout = loadoutManager.GetLoadoutByName(customModeName);
+            else
+                loadout = loadoutManager.GetLoadout(mode);
             
             // Two-pass approach: Give ammo and equipment first, then weapons
             // This ensures ammo is available when weapons auto-load
@@ -1448,29 +2281,6 @@ namespace Oxide.Plugins
             }
         }
         
-        private DuelMode ParseDuelMode(string mode)
-        {
-            switch (mode.ToLower())
-            {
-                case "ak":
-                case "ak47":
-                    return DuelMode.AK47;
-                case "sar":
-                case "semiauto":
-                    return DuelMode.SAR;
-                case "speargun":
-                case "spear":
-                    return DuelMode.Speargun;
-                case "bow":
-                    return DuelMode.Bow;
-                case "revolver":
-                case "rev":
-                    return DuelMode.Revolver;
-                default:
-                    return DuelMode.None;
-            }
-        }
-        
         private void UpdatePlayerStats(ulong playerID, bool won, ActiveMatch match)
         {
             if (!playerData.ContainsKey(playerID))
@@ -1482,16 +2292,24 @@ namespace Oxide.Plugins
             data.TotalMatches++;
             data.LastMatchTime = DateTime.Now; // Update timestamp for leaderboard filtering
             
+            // Determine queue key before recording stat events so it can be stored per-event
+            string queueKey = GetMatchQueueKey(match);
+            
             if (won)
             {
                 data.Wins++;
-                data.StatEvents.Add(new StatEvent { Type = "Win", Timestamp = DateTime.Now });
+                data.StatEvents.Add(new StatEvent { Type = "Win", Timestamp = DateTime.Now, QueueKey = queueKey });
             }
             else
             {
                 data.Losses++;
-                data.StatEvents.Add(new StatEvent { Type = "Loss", Timestamp = DateTime.Now });
+                data.StatEvents.Add(new StatEvent { Type = "Loss", Timestamp = DateTime.Now, QueueKey = queueKey });
             }
+            
+            // Record per-queue win/loss (cumulative, kept for compatibility)
+            var queueDict = won ? data.WinsByQueue : data.LossesByQueue;
+            if (!queueDict.ContainsKey(queueKey)) queueDict[queueKey] = 0;
+            queueDict[queueKey]++;
             
             if (playerID == match.Player1ID)
             {
@@ -1527,6 +2345,55 @@ namespace Oxide.Plugins
             data.WinRate = (float)data.Wins / data.TotalMatches * 100f;
         }
         
+        // Returns the leaderboard key for the queue type a match was played in.
+        // RoomID is checked first so private-room matches are never misclassified as public.
+        // The SourceQueueType fallback to "Public" only applies to the legacy queueManager system,
+        // which only ever ran public (random-mode) matches.
+        private string GetMatchQueueKey(ActiveMatch match)
+        {
+            if (match.RoomID != null) return "Private";
+            // Custom public-queue match (no SourceQueueType, but has a custom kit name)
+            if (match.Mode == DuelMode.Custom && match.CustomModeName != null && !match.SourceQueueType.HasValue)
+                return match.CustomModeName;
+            if (!match.SourceQueueType.HasValue) return "Public"; // Legacy fallback
+            switch (match.SourceQueueType.Value)
+            {
+                case QueueType.PublicAK:       return "AK";
+                case QueueType.PublicBow:      return "Bow";
+                case QueueType.PublicSpeargun: return "Speargun";
+                default:                       return "Public";
+            }
+        }
+        
+        // Returns true when a match was started from a custom public-queue (not a private room,
+        // not a built-in typed queue) and is therefore associated with customQueuesByName.
+        private bool IsCustomPublicQueueMatch(ActiveMatch match) =>
+            match.RoomID == null &&
+            match.Mode == DuelMode.Custom &&
+            match.CustomModeName != null &&
+            !match.SourceQueueType.HasValue;
+        
+        // Returns a human-readable label for a QueueType (used in chat messages).
+        private string GetQueueLabel(QueueType queueType)
+        {
+            switch (queueType)
+            {
+                case QueueType.PublicAK:       return "AK";
+                case QueueType.PublicBow:      return "Bow";
+                case QueueType.PublicSpeargun: return "Speargun";
+                default:                       return "Public";
+            }
+        }
+        
+        // Returns win rate (0-100) for a specific queue key, or 0 when no games played.
+        private float GetQueueWinRate(PlayerData data, string queueKey)
+        {
+            int w = data.WinsByQueue.ContainsKey(queueKey)  ? data.WinsByQueue[queueKey]  : 0;
+            int l = data.LossesByQueue.ContainsKey(queueKey) ? data.LossesByQueue[queueKey] : 0;
+            int total = w + l;
+            return total > 0 ? (float)w / total * 100f : 0f;
+        }
+        
         private void UpdateWinRate(ulong playerID)
         {
             if (playerData.ContainsKey(playerID))
@@ -1551,8 +2418,13 @@ namespace Oxide.Plugins
         {
             if (player == null || !arenaManager.IsLobbySet()) return true;
             
-            float distance = Vector3.Distance(player.transform.position, arenaManager.GetLobbyPosition());
-            return distance <= arenaManager.GetLobbyRadius();
+            float radius = arenaManager.GetLobbyRadius();
+            foreach (var spawn in arenaManager.GetLobbySpawnPoints())
+            {
+                if (Vector3.Distance(player.transform.position, spawn) <= radius)
+                    return true;
+            }
+            return false;
         }
         
         private bool IsInArenaZone(BasePlayer player, Arena arena)
@@ -1673,34 +2545,20 @@ namespace Oxide.Plugins
             
             var elements = new CuiElementContainer();
             
-            // Main button panel - bottom right area (slightly left to avoid health UI), orange/red for leave action
+            // Smaller button positioned to the right of center
             elements.Add(new CuiPanel
             {
                 Image = { Color = "0.8 0.3 0.2 0.9" }, // Orange/Red
-                RectTransform = { AnchorMin = "0.70 0.02", AnchorMax = "0.83 0.10" },
+                RectTransform = { AnchorMin = "0.65 0.072", AnchorMax = "0.78 0.108" },
                 CursorEnabled = false  // Don't capture cursor
             }, "Hud", "LeaveButton");
             
-            // Title
-            elements.Add(new CuiLabel
-            {
-                Text = { Text = "LEAVE", FontSize = 16, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" },
-                RectTransform = { AnchorMin = "0 0.5", AnchorMax = "1 1" }
-            }, "LeaveButton");
-            
-            // Subtitle
-            elements.Add(new CuiLabel
-            {
-                Text = { Text = "Match/Queue", FontSize = 10, Align = TextAnchor.MiddleCenter, Color = "0.9 0.9 0.9 1" },
-                RectTransform = { AnchorMin = "0 0", AnchorMax = "1 0.5" }
-            }, "LeaveButton");
-            
-            // Clickable button
+            // Clickable button (fills panel, also carries the label)
             elements.Add(new CuiButton
             {
                 Button = { Command = "leavebutton.click", Color = "0 0 0 0" }, // Transparent overlay
                 RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" },
-                Text = { Text = "" }
+                Text = { Text = "leave", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
             }, "LeaveButton");
             
             CuiHelper.AddUi(player, elements);
@@ -1726,13 +2584,14 @@ namespace Oxide.Plugins
             
             var elements = new CuiElementContainer();
             
-            // Main panel - right side, dark gray background
+            // Main panel - top right, dark gray background
+            // CursorEnabled = false so the panel doesn't capture the cursor and lock camera rotation
             elements.Add(new CuiPanel
             {
                 Image = { Color = "0.17 0.17 0.17 0.95" }, // Dark gray #2B2B2B
-                RectTransform = { AnchorMin = "0.70 0.15", AnchorMax = "0.98 0.85" },
-                CursorEnabled = true
-            }, "Overlay", "LobbyBrowser");
+                RectTransform = { AnchorMin = "0.70 0.30", AnchorMax = "0.98 0.99" },
+                CursorEnabled = false
+            }, "Hud", "LobbyBrowser");
             
             // Header: "TEAM MATCHES" - Cyan
             elements.Add(new CuiLabel
@@ -1772,13 +2631,35 @@ namespace Oxide.Plugins
             int publicCount = queuesByType.ContainsKey(QueueType.Public) ? queuesByType[QueueType.Public].Count : 0;
             AddQueueEntry(elements, "LobbyBrowser", "Public", $"({publicCount} Players)", queueY, "joinqueue.public");
             
-            // Public AK queue - increased spacing to prevent overlap
-            queueY -= 0.10f; // Increased from 0.08f to 0.10f for better spacing
+            // Public AK queue
+            queueY -= 0.08f;
             int akCount = queuesByType.ContainsKey(QueueType.PublicAK) ? queuesByType[QueueType.PublicAK].Count : 0;
             AddQueueEntry(elements, "LobbyBrowser", "Public AK", $"({akCount} Players)", queueY, "joinqueue.ak");
             
+            // Public Bow queue
+            queueY -= 0.08f;
+            int bowCount = queuesByType.ContainsKey(QueueType.PublicBow) ? queuesByType[QueueType.PublicBow].Count : 0;
+            AddQueueEntry(elements, "LobbyBrowser", "Public Bow", $"({bowCount} Players)", queueY, "joinqueue.bow");
+            
+            // Public Speargun queue (shown only when enabled)
+            if (config.EnableSpeargun)
+            {
+                queueY -= 0.08f;
+                int spearCount = queuesByType.ContainsKey(QueueType.PublicSpeargun) ? queuesByType[QueueType.PublicSpeargun].Count : 0;
+                AddQueueEntry(elements, "LobbyBrowser", "Speargun", $"({spearCount} Players)", queueY, "joinqueue.spear");
+            }
+            
+            // Public custom-kit queues (one row per custom loadout in config)
+            foreach (var kvp in customQueuesByName)
+            {
+                queueY -= 0.08f;
+                int customCount = kvp.Value.Count;
+                AddQueueEntry(elements, "LobbyBrowser", kvp.Key, $"({customCount} Players)", queueY, $"joinqueue.custom {kvp.Key}");
+            }
+            
             // ========== PRIVATE ROOMS SECTION ==========
-            float privateStartY = 0.42f;
+            // Calculate available space: clamp so private section doesn't collide with queue entries
+            float privateStartY = Math.Max(queueY - 0.06f, 0.20f);
             
             // "PRIVATE ROOMS" header
             elements.Add(new CuiLabel
@@ -1794,17 +2675,17 @@ namespace Oxide.Plugins
                 RectTransform = { AnchorMin = $"0.05 {privateStartY - 0.005f}", AnchorMax = $"0.95 {privateStartY}" }
             }, "LobbyBrowser");
             
-            // Private room listings (placeholder for Phase 4)
+            // Private room listings — show up to 4 rooms
             float roomY = privateStartY - 0.08f;
             int roomCount = 0;
-            foreach (var room in privateRooms.Values.Take(5)) // Show up to 5 rooms
+            foreach (var room in privateRooms.Values.Take(4))
             {
-                AddRoomEntry(elements, "LobbyBrowser", room, roomY);
-                roomY -= 0.07f;
+                AddRoomEntry(elements, "LobbyBrowser", room, roomY, player.userID);
+                roomY -= 0.08f;
                 roomCount++;
             }
             
-            // If no rooms, show message
+            // If no rooms, show placeholder
             if (roomCount == 0)
             {
                 elements.Add(new CuiLabel
@@ -1814,14 +2695,30 @@ namespace Oxide.Plugins
                 }, "LobbyBrowser");
             }
             
-            // "CREATE ROOM +" button at bottom
-            float createButtonY = 0.05f;
-            elements.Add(new CuiButton
+            // CREATE ROOM button — single click creates a room; mode is chosen afterwards via the GUNS button
+            float createButtonY = 0.055f;
+            
+            bool ownsRoom = privateRooms.Values.Any(r => r.OwnerID == player.userID);
+            if (ownsRoom)
             {
-                Button = { Command = "lobby.createroom", Color = "0 0.8 0.82 0.8" }, // Cyan button
-                RectTransform = { AnchorMin = $"0.10 {createButtonY}", AnchorMax = $"0.90 {createButtonY + 0.06f}" },
-                Text = { Text = "CREATE ROOM +", FontSize = 14, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
-            }, "LobbyBrowser");
+                // Player already has a room — show disabled state
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = "", Color = "0.3 0.3 0.3 0.6" },
+                    RectTransform = { AnchorMin = $"0.10 {createButtonY}", AnchorMax = $"0.90 {createButtonY + 0.06f}" },
+                    Text = { Text = "YOU HAVE A ROOM", FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                }, "LobbyBrowser");
+            }
+            else
+            {
+                // Single CREATE ROOM button — mode is chosen after creation via the GUNS button
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = "lobby.createroom", Color = "0 0.8 0.82 0.8" },
+                    RectTransform = { AnchorMin = $"0.10 {createButtonY}", AnchorMax = $"0.90 {createButtonY + 0.06f}" },
+                    Text = { Text = "CREATE ROOM", FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                }, "LobbyBrowser");
+            }
             
             CuiHelper.AddUi(player, elements);
         }
@@ -1836,18 +2733,18 @@ namespace Oxide.Plugins
                 RectTransform = { AnchorMin = $"0.05 {yPos}", AnchorMax = $"0.95 {yPos + 0.07f}" }
             }, parent, entryName);
             
-            // Queue name
+            // Queue name (top half of the entry)
             elements.Add(new CuiLabel
             {
                 Text = { Text = queueName, FontSize = 13, Align = TextAnchor.MiddleLeft, Color = "1 1 1 1" },
-                RectTransform = { AnchorMin = "0.05 0", AnchorMax = "0.60 1" }
+                RectTransform = { AnchorMin = "0.05 0.50", AnchorMax = "0.65 1" }
             }, entryName);
             
-            // Player count
+            // Player count (bottom half of the entry)
             elements.Add(new CuiLabel
             {
-                Text = { Text = playerCount, FontSize = 11, Align = TextAnchor.MiddleLeft, Color = "0.7 0.7 0.7 1" },
-                RectTransform = { AnchorMin = "0.05 0", AnchorMax = "0.60 1" }
+                Text = { Text = playerCount, FontSize = 10, Align = TextAnchor.MiddleLeft, Color = "0.7 0.7 0.7 1" },
+                RectTransform = { AnchorMin = "0.05 0", AnchorMax = "0.65 0.50" }
             }, entryName);
             
             // JOIN button
@@ -1859,37 +2756,267 @@ namespace Oxide.Plugins
             }, entryName);
         }
         
-        private void AddRoomEntry(CuiElementContainer elements, string parent, PrivateRoom room, float yPos)
+        private void AddRoomEntry(CuiElementContainer elements, string parent, PrivateRoom room, float yPos, ulong viewerID)
         {
-            // Background panel for room entry
+            // Background panel for room entry (taller to accommodate mode label + buttons)
             string entryName = $"{parent}.Room.{room.RoomID}";
             elements.Add(new CuiPanel
             {
                 Image = { Color = "0.12 0.12 0.12 0.8" },
-                RectTransform = { AnchorMin = $"0.05 {yPos}", AnchorMax = $"0.95 {yPos + 0.06f}" }
+                RectTransform = { AnchorMin = $"0.05 {yPos}", AnchorMax = $"0.95 {yPos + 0.07f}" }
             }, parent, entryName);
             
-            // Room info: "(X) PlayerName"
-            string roomText = $"({room.PlayerIDs.Count}) {room.OwnerName}";
+            // Room name: "OwnerName's Room (X)"
+            string roomText = $"{room.OwnerName} ({room.PlayerIDs.Count})";
             elements.Add(new CuiLabel
             {
                 Text = { Text = roomText, FontSize = 12, Align = TextAnchor.MiddleLeft, Color = "1 1 1 1" },
-                RectTransform = { AnchorMin = "0.05 0", AnchorMax = "0.60 1" }
+                RectTransform = { AnchorMin = "0.05 0.50", AnchorMax = "0.55 1" }
             }, entryName);
             
-            // JOIN button
-            elements.Add(new CuiButton
+            // Mode label — show custom name when applicable
+            string modeLabel = room.CustomModeName != null ? $"[{room.CustomModeName}]" : $"[{room.Mode}]";
+            elements.Add(new CuiLabel
             {
-                Button = { Command = $"lobby.joinroom {room.RoomID}", Color = "0 0.8 0.82 1" },
-                RectTransform = { AnchorMin = "0.70 0.15", AnchorMax = "0.95 0.85" },
-                Text = { Text = "JOIN", FontSize = 11, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                Text = { Text = modeLabel, FontSize = 10, Align = TextAnchor.MiddleLeft, Color = "0 0.8 0.82 1" },
+                RectTransform = { AnchorMin = "0.05 0.05", AnchorMax = "0.45 0.50" }
             }, entryName);
+            
+            bool isOwner = viewerID == room.OwnerID;
+            bool isMember = room.PlayerIDs.Contains(viewerID);
+            bool hasPending = room.PendingRequests.ContainsKey(viewerID);
+            
+            if (isOwner)
+            {
+                // Owner: GUNS button + LEAVE button
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = "lobby.roomguns", Color = "0.25 0.35 0.75 0.9" },
+                    RectTransform = { AnchorMin = "0.55 0.15", AnchorMax = "0.74 0.85" },
+                    Text = { Text = "GUNS", FontSize = 10, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                }, entryName);
+                
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = "lobby.leaveroom", Color = "0.7 0.2 0.1 0.9" },
+                    RectTransform = { AnchorMin = "0.76 0.15", AnchorMax = "0.95 0.85" },
+                    Text = { Text = "LEAVE", FontSize = 10, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                }, entryName);
+                
+                // Show pending request badge
+                if (room.PendingRequests.Count > 0)
+                {
+                    elements.Add(new CuiLabel
+                    {
+                        Text = { Text = $"▲ {room.PendingRequests.Count} request(s)", FontSize = 9, Align = TextAnchor.MiddleRight, Color = "1 0.7 0.1 1" },
+                        RectTransform = { AnchorMin = "0.45 0.05", AnchorMax = "0.97 0.50" }
+                    }, entryName);
+                }
+            }
+            else if (isMember)
+            {
+                // Member: LEAVE button
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = "lobby.leaveroom", Color = "0.7 0.2 0.1 0.9" },
+                    RectTransform = { AnchorMin = "0.76 0.15", AnchorMax = "0.95 0.85" },
+                    Text = { Text = "LEAVE", FontSize = 10, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                }, entryName);
+            }
+            else if (hasPending)
+            {
+                // Has a pending request — show greyed out indicator
+                elements.Add(new CuiLabel
+                {
+                    Text = { Text = "PENDING...", FontSize = 9, Align = TextAnchor.MiddleCenter, Color = "0.7 0.7 0.1 1" },
+                    RectTransform = { AnchorMin = "0.65 0.15", AnchorMax = "0.95 0.85" }
+                }, entryName);
+            }
+            else
+            {
+                // Non-member: REQUEST button
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = $"lobby.requestjoin {room.RoomID}", Color = "0 0.8 0.82 1" },
+                    RectTransform = { AnchorMin = "0.68 0.15", AnchorMax = "0.95 0.85" },
+                    Text = { Text = "REQUEST", FontSize = 10, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                }, entryName);
+            }
         }
         
         private void DestroyLobbyBrowser(BasePlayer player)
         {
             if (player == null) return;
             CuiHelper.DestroyUi(player, "LobbyBrowser");
+        }
+        
+        private void ShowJoinRequestUI(BasePlayer owner, string roomID)
+        {
+            if (owner == null || !owner.IsConnected || !privateRooms.ContainsKey(roomID)) return;
+            
+            // Don't interrupt an active match
+            if (activeMatches.ContainsKey(owner.userID)) return;
+            
+            var room = privateRooms[roomID];
+            
+            DestroyJoinRequestUI(owner);
+            
+            if (room.PendingRequests.Count == 0) return;
+            
+            var elements = new CuiElementContainer();
+            
+            // Panel sits at top-center, height depends on number of requests (up to 3)
+            int shown = Math.Min(room.PendingRequests.Count, 3);
+            float panelH = 0.07f + shown * 0.09f;
+            float panelBottom = 0.98f - panelH;
+            
+            elements.Add(new CuiPanel
+            {
+                Image = { Color = "0.13 0.13 0.13 0.97" },
+                RectTransform = { AnchorMin = $"0.30 {panelBottom:F4}", AnchorMax = "0.70 0.98" },
+                CursorEnabled = false
+            }, "Hud", "JoinRequestUI");
+            
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = "JOIN REQUESTS", FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "0 0.8 0.82 1" },
+                RectTransform = { AnchorMin = "0 0.86", AnchorMax = "1 1" }
+            }, "JoinRequestUI");
+            
+            float rowY = 0.84f;
+            int count = 0;
+            foreach (var kvp in room.PendingRequests)
+            {
+                if (count >= 3) break;
+                ulong requesterID = kvp.Key;
+                string requesterName = kvp.Value;
+                
+                string rowName = $"JoinRequestUI.Row.{requesterID}";
+                elements.Add(new CuiPanel
+                {
+                    Image = { Color = "0.10 0.10 0.10 0.9" },
+                    RectTransform = { AnchorMin = $"0.04 {rowY - 0.24f:F4}", AnchorMax = $"0.96 {rowY:F4}" }
+                }, "JoinRequestUI", rowName);
+                
+                elements.Add(new CuiLabel
+                {
+                    Text = { Text = requesterName, FontSize = 11, Align = TextAnchor.MiddleLeft, Color = "1 1 1 1" },
+                    RectTransform = { AnchorMin = "0.05 0", AnchorMax = "0.50 1" }
+                }, rowName);
+                
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = $"lobby.accept {requesterID}", Color = "0.1 0.65 0.1 0.9" },
+                    RectTransform = { AnchorMin = "0.52 0.12", AnchorMax = "0.74 0.88" },
+                    Text = { Text = "ACCEPT", FontSize = 10, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                }, rowName);
+                
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = $"lobby.decline {requesterID}", Color = "0.65 0.1 0.1 0.9" },
+                    RectTransform = { AnchorMin = "0.76 0.12", AnchorMax = "0.96 0.88" },
+                    Text = { Text = "DECLINE", FontSize = 10, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                }, rowName);
+                
+                rowY -= 0.28f;
+                count++;
+            }
+            
+            CuiHelper.AddUi(owner, elements);
+            activeJoinRequestUIs.Add(owner.userID);
+        }
+        
+        private void DestroyJoinRequestUI(BasePlayer player)
+        {
+            if (player == null) return;
+            CuiHelper.DestroyUi(player, "JoinRequestUI");
+            activeJoinRequestUIs.Remove(player.userID);
+        }
+        
+        private void ShowGunSelectUI(BasePlayer player, string roomID)
+        {
+            if (player == null || !privateRooms.ContainsKey(roomID)) return;
+            var room = privateRooms[roomID];
+            if (room.OwnerID != player.userID) return;
+            
+            CuiHelper.DestroyUi(player, "RoomGunSelect");
+            
+            // Build the mode list first so we can size the panel accordingly
+            var modeList = new List<(string Label, string ModeArg)>();
+            modeList.Add(("AK47", "AK47"));
+            modeList.Add(("SAR", "SAR"));
+            modeList.Add(("Bow", "Bow"));
+            modeList.Add(("Revolver", "Revolver"));
+            modeList.Add(("Random", "Any"));
+            if (config.EnableSpeargun)
+                modeList.Add(("Speargun", "Speargun"));
+            // Custom modes: any config loadout key not in the built-in set
+            foreach (var key in config.Loadouts.Keys)
+            {
+                if (!BuiltInKitNames.Contains(key))
+                    modeList.Add((key, key));
+            }
+            
+            // Dynamically size the panel: each button up to 0.11 + 0.01 gap, header 0.12, close button 0.10 + margins
+            float gap       = 0.01f;
+            float closeBtnH = 0.10f;
+            // Scale button height down when there are many modes so everything fits within the panel.
+            // Available relative height for buttons = btnStartY(0.84) - closeBtnH - 2*gap
+            float btnH = modeList.Count > 0
+                ? Math.Min(0.11f, (0.84f - closeBtnH - 2f * gap) / modeList.Count - gap)
+                : 0.11f;
+            int   btnFontSize  = btnH >= 0.095f ? 13 : (btnH >= 0.075f ? 11 : 10);
+            float panelContentH = 0.12f + modeList.Count * (btnH + gap) + closeBtnH + 0.03f; // header + buttons + close
+            float panelTop    = 0.95f;
+            float panelBottom = Math.Max(GunSelectPanelMinBottom, panelTop - panelContentH);
+            
+            var elements = new CuiElementContainer();
+            
+            elements.Add(new CuiPanel
+            {
+                Image = { Color = "0.13 0.13 0.13 0.97" },
+                RectTransform = { AnchorMin = $"0.38 {panelBottom:F4}", AnchorMax = $"0.62 {panelTop:F4}" },
+                CursorEnabled = false
+            }, "Hud", "RoomGunSelect");
+            
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = "SELECT WEAPON MODE", FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "0 0.8 0.82 1" },
+                RectTransform = { AnchorMin = "0 0.88", AnchorMax = "1 1" }
+            }, "RoomGunSelect");
+            
+            // Determine currently-active mode label for the room
+            string activeLabel = room.CustomModeName ?? (room.Mode == DuelMode.Any ? "Any" : room.Mode.ToString());
+            
+            float btnY = 0.84f;
+            foreach (var (label, modeArg) in modeList)
+            {
+                bool selected = string.Equals(activeLabel, modeArg, StringComparison.OrdinalIgnoreCase)
+                             || (modeArg == "Any" && activeLabel == "Random");
+                string btnColor = selected ? "0.1 0.55 0.1 0.95" : "0.22 0.22 0.22 0.95";
+                string checkmark = selected ? " ✓" : "";
+                
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = $"lobby.roomsetmode {modeArg}", Color = btnColor },
+                    RectTransform = { AnchorMin = $"0.08 {btnY - btnH:F4}", AnchorMax = $"0.92 {btnY:F4}" },
+                    Text = { Text = $"{label}{checkmark}", FontSize = btnFontSize, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+                }, "RoomGunSelect");
+                
+                btnY -= btnH + gap;
+            }
+            
+            // CLOSE button — position dynamically below last mode button so it never overlaps
+            float closeBtnMax = btnY - gap;
+            float closeBtnMin = closeBtnMax - closeBtnH;
+            elements.Add(new CuiButton
+            {
+                Button = { Command = "lobby.closeguns", Color = "0.55 0.1 0.1 0.9" },
+                RectTransform = { AnchorMin = $"0.08 {closeBtnMin:F4}", AnchorMax = $"0.92 {closeBtnMax:F4}" },
+                Text = { Text = "CLOSE", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+            }, "RoomGunSelect");
+            
+            CuiHelper.AddUi(player, elements);
         }
         
         // ============================================
@@ -1908,6 +3035,14 @@ namespace Oxide.Plugins
                 queueManager.LeaveQueue(player.userID);
                 SendReply(player, "You left the queue.");
                 DestroyLeaveButton(player);
+                TeleportToLobby(player);
+                return;
+            }
+            
+            // Check if player is in Phase 3 public queue
+            if (GetPlayerQueueType(player.userID).HasValue)
+            {
+                LeaveQueueInternal(player, true); // handles DestroyLeaveButton internally
                 TeleportToLobby(player);
                 return;
             }
@@ -1955,13 +3090,51 @@ namespace Oxide.Plugins
                 // Return both players to lobby
                 DestroyLeaveButton(player);
                 TeleportToLobby(player);
+                // Also remove forfeiting player from their private room so they can freely queue
+                var forfeiterRoomID = GetPlayerRoom(player.userID);
+                if (forfeiterRoomID != null)
+                {
+                    LeaveRoom(player, forfeiterRoomID);
+                }
                 ShowLobbyBrowser(player); // Show lobby browser instead
+                DestroyLeaderboardUI(player); // Hide leaderboard when returning to lobby
                 
                 if (opponent != null && opponent.IsConnected)
                 {
                     DestroyLeaveButton(opponent);
                     TeleportToLobby(opponent);
                     ShowLobbyBrowser(opponent); // Show lobby browser instead
+                    DestroyLeaderboardUI(opponent); // Hide leaderboard when returning to lobby
+                }
+                
+                // For room matches: re-add the remaining player (opponent) to the waiting
+                // queue so the next match can start when someone rejoins the room.
+                string matchRoomID = match.RoomID;
+                if (matchRoomID != null && privateRooms.ContainsKey(matchRoomID))
+                {
+                    var room = privateRooms[matchRoomID];
+                    if (opponent != null && opponent.IsConnected
+                        && room.PlayerIDs.Contains(opponentID)
+                        && !room.WaitingQueue.Contains(opponentID))
+                    {
+                        room.WaitingQueue.Add(opponentID);
+                    }
+                    timer.Once(1.5f, () => TryRoomMatchmaking(matchRoomID));
+                }
+                else if (opponent != null && opponent.IsConnected)
+                {
+                    // Public match: auto-requeue the opponent (they didn't forfeit)
+                    if (!autoRequeueOptOut.Contains(opponentID))
+                    {
+                        if (IsCustomPublicQueueMatch(match))
+                            JoinCustomQueue(opponent, match.CustomModeName);
+                        else
+                            JoinQueueByType(opponent, match.SourceQueueType ?? QueueType.Public);
+                    }
+                    else
+                    {
+                        SendReply(opponent, "Auto-requeue disabled. Click JOIN QUEUE to play again.");
+                    }
                 }
                 
                 SavePlayerData();
@@ -1972,15 +3145,12 @@ namespace Oxide.Plugins
                 return;
             }
             
-            // Not in queue or match - just send to lobby
+            // Not in queue or match - also leave any private room, then go to lobby
+            var catchAllRoomID = GetPlayerRoom(player.userID);
+            if (catchAllRoomID != null)
+                LeaveRoom(player, catchAllRoomID);
             DestroyLeaveButton(player);
             TeleportToLobby(player);
-        }
-        
-        private DuelMode GetRandomMode()
-        {
-            // For JOIN QUEUE button, use Any mode to enable cross-mode matching
-            return DuelMode.Any;
         }
         
         [ConsoleCommand("joinqueue.click")]
@@ -1988,6 +3158,13 @@ namespace Oxide.Plugins
         {
             var player = arg.Player();
             if (player == null) return;
+            
+            // Block if player is inside a private room
+            if (GetPlayerRoom(player.userID) != null)
+            {
+                SendReply(player, "You must leave your private room before joining a public queue!");
+                return;
+            }
             
             // Check if already in queue
             if (queueManager.IsQueued(player.userID))
@@ -2033,38 +3210,125 @@ namespace Oxide.Plugins
             JoinQueueByType(player, QueueType.PublicAK);
         }
         
+        [ConsoleCommand("joinqueue.bow")]
+        private void JoinQueueBowCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+            
+            JoinQueueByType(player, QueueType.PublicBow);
+        }
+        
+        [ConsoleCommand("joinqueue.spear")]
+        private void JoinQueueSpearCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+            
+            if (!config.EnableSpeargun)
+            {
+                SendReply(player, "Speargun mode is currently disabled.");
+                return;
+            }
+            
+            JoinQueueByType(player, QueueType.PublicSpeargun);
+        }
+        
+        [ConsoleCommand("joinqueue.custom")]
+        private void JoinQueueCustomCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+            
+            if (arg.Args == null || arg.Args.Length < 1)
+            {
+                SendReply(player, "Usage: joinqueue.custom <kitName>");
+                return;
+            }
+            
+            string kitName = arg.Args[0];
+            if (!customQueuesByName.ContainsKey(kitName))
+            {
+                SendReply(player, $"Unknown custom kit: {kitName}");
+                return;
+            }
+            
+            JoinCustomQueue(player, kitName);
+        }
+        
         [ConsoleCommand("lobby.createroom")]
         private void CreateRoomCommand(ConsoleSystem.Arg arg)
         {
             var player = arg.Player();
             if (player == null) return;
-            
-            if (arg.Args == null || arg.Args.Length == 0)
+            DuelMode mode = DuelMode.AK47;
+            string customName = null;
+            if (arg.Args != null && arg.Args.Length > 0)
             {
-                SendReply(player, "Usage: lobby.createroom <roomName>");
-                SendReply(player, "Example: lobby.createroom My Epic Room");
-                return;
+                switch (arg.Args[0].ToUpper())
+                {
+                    case "AK47":     mode = DuelMode.AK47;     break;
+                    case "SAR":      mode = DuelMode.SAR;      break;
+                    case "BOW":      mode = DuelMode.Bow;      break;
+                    case "REVOLVER": mode = DuelMode.Revolver; break;
+                    case "ANY":      mode = DuelMode.Any;      break;
+                    case "SPEARGUN":
+                        mode = config.EnableSpeargun ? DuelMode.Speargun : DuelMode.AK47;
+                        break;
+                    default:
+                        // Check for a custom loadout name (case-insensitive)
+                        var matched = config.Loadouts.Keys.FirstOrDefault(k =>
+                            string.Equals(k, arg.Args[0], StringComparison.OrdinalIgnoreCase));
+                        if (matched != null)
+                        {
+                            mode = DuelMode.Custom;
+                            customName = matched;
+                        }
+                        break;
+                }
             }
-            
-            var roomName = string.Join(" ", arg.Args);
-            CreateRoom(player, roomName);
+            CreateRoom(player, mode, customName);
         }
         
+        // lobby.joinroom kept as alias → forwards to the request flow
         [ConsoleCommand("lobby.joinroom")]
         private void JoinRoomCommand(ConsoleSystem.Arg arg)
         {
             var player = arg.Player();
             if (player == null) return;
-            
-            if (arg.Args == null || arg.Args.Length == 0)
-            {
-                SendReply(player, "Usage: lobby.joinroom <roomID>");
-                SendReply(player, "Example: lobby.joinroom A7K3M9");
-                return;
-            }
-            
-            var roomID = arg.Args[0].ToUpper();
-            JoinRoom(player, roomID);
+            if (arg.Args == null || arg.Args.Length == 0) return;
+            RequestJoinRoom(player, arg.Args[0]);
+        }
+        
+        [ConsoleCommand("lobby.requestjoin")]
+        private void RequestJoinRoomCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+            if (arg.Args == null || arg.Args.Length == 0) return;
+            RequestJoinRoom(player, arg.Args[0]);
+        }
+        
+        [ConsoleCommand("lobby.accept")]
+        private void AcceptJoinCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null || arg.Args == null || arg.Args.Length == 0) return;
+            if (!ulong.TryParse(arg.Args[0], out ulong requesterID)) return;
+            var roomID = GetOwnedRoom(player.userID);
+            if (roomID == null) return;
+            AcceptJoinRequest(player, requesterID, roomID);
+        }
+        
+        [ConsoleCommand("lobby.decline")]
+        private void DeclineJoinCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null || arg.Args == null || arg.Args.Length == 0) return;
+            if (!ulong.TryParse(arg.Args[0], out ulong requesterID)) return;
+            var roomID = GetOwnedRoom(player.userID);
+            if (roomID == null) return;
+            DeclineJoinRequest(player.userID, requesterID, roomID);
         }
         
         [ConsoleCommand("lobby.leaveroom")]
@@ -2089,14 +3353,46 @@ namespace Oxide.Plugins
             var player = arg.Player();
             if (player == null) return;
             
-            var roomID = GetPlayerRoom(player.userID);
+            var roomID = GetOwnedRoom(player.userID);
             if (roomID == null)
             {
-                SendReply(player, "You're not in any room!");
+                SendReply(player, "You need to own a room to start a match!");
                 return;
             }
             
-            StartRoomMatch(player, roomID);
+            TryRoomMatchmaking(roomID);
+        }
+        
+        [ConsoleCommand("lobby.roomguns")]
+        private void RoomGunsCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+            var roomID = GetOwnedRoom(player.userID);
+            if (roomID == null)
+            {
+                SendReply(player, "You need to own a room to change its weapon mode!");
+                return;
+            }
+            ShowGunSelectUI(player, roomID);
+        }
+        
+        [ConsoleCommand("lobby.roomsetmode")]
+        private void RoomSetModeCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null || arg.Args == null || arg.Args.Length == 0) return;
+            var roomID = GetOwnedRoom(player.userID);
+            if (roomID == null) return;
+            SetRoomMode(player, roomID, arg.Args[0]);
+        }
+        
+        [ConsoleCommand("lobby.closeguns")]
+        private void CloseGunsCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+            CuiHelper.DestroyUi(player, "RoomGunSelect");
         }
         
         #endregion
@@ -2106,6 +3402,13 @@ namespace Oxide.Plugins
         private void JoinQueueByType(BasePlayer player, QueueType queueType)
         {
             if (player == null) return;
+            
+            // Block if player is inside a private room
+            if (GetPlayerRoom(player.userID) != null)
+            {
+                SendReply(player, "You must leave your private room before joining a public queue!");
+                return;
+            }
             
             // Check if player is already in a match
             if (activeMatches.Values.Any(d => d.Player1ID == player.userID || d.Player2ID == player.userID))
@@ -2126,6 +3429,11 @@ namespace Oxide.Plugins
                 // Remove from current queue
                 LeaveQueueInternal(player, false);
             }
+            else if (GetPlayerCustomQueue(player.userID) != null)
+            {
+                // Was in a custom queue — leave it
+                LeaveQueueInternal(player, false);
+            }
             
             // Add to specified queue
             if (!queuesByType.ContainsKey(queueType))
@@ -2137,11 +3445,12 @@ namespace Oxide.Plugins
             
             string queueName = queueType == QueueType.Public ? "Public" :
                               queueType == QueueType.PublicAK ? "AK" :
-                              queueType == QueueType.PublicSAR ? "SAR" :
-                              queueType == QueueType.PublicBow ? "Bow" : "Revolver";
+                              queueType == QueueType.PublicBow ? "Bow" :
+                              queueType == QueueType.PublicSpeargun ? "Speargun" : "Unknown";
             
             SendReply(player, $"Joined {queueName} queue! Waiting for opponent...");
             ShowLobbyBrowser(player);
+            ShowLeaveButton(player); // Show leave button while waiting in queue
         }
         
         private void LeaveQueueInternal(BasePlayer player, bool updateUI = true)
@@ -2157,10 +3466,25 @@ namespace Oxide.Plugins
                 }
             }
             
-            if (wasInQueue && updateUI)
+            // Also remove from custom kit queues
+            foreach (var queue in customQueuesByName.Values)
             {
-                SendReply(player, "Left the queue.");
-                ShowLobbyBrowser(player);
+                if (queue.Remove(player.userID))
+                {
+                    wasInQueue = true;
+                }
+            }
+            
+            if (wasInQueue)
+            {
+                // Always destroy leave button when leaving a queue (regardless of updateUI)
+                DestroyLeaveButton(player);
+                
+                if (updateUI)
+                {
+                    SendReply(player, "Left the queue.");
+                    ShowLobbyBrowser(player);
+                }
             }
         }
         
@@ -2176,20 +3500,17 @@ namespace Oxide.Plugins
             return null;
         }
         
-        private int GetQueuePlayerCount(QueueType queueType)
-        {
-            if (queuesByType.ContainsKey(queueType))
-            {
-                return queuesByType[queueType].Count;
-            }
-            return 0;
-        }
-        
         private void ProcessAllQueues()
         {
             foreach (QueueType queueType in Enum.GetValues(typeof(QueueType)))
             {
                 TryMatchPlayersInQueue(queueType);
+            }
+            
+            // Process custom-kit public queues
+            foreach (var kitName in customQueuesByName.Keys)
+            {
+                TryMatchCustomQueue(kitName);
             }
         }
         
@@ -2226,41 +3547,107 @@ namespace Oxide.Plugins
                 case QueueType.PublicAK:
                     mode = DuelMode.AK47;
                     break;
-                case QueueType.PublicSAR:
-                    mode = DuelMode.SAR;
-                    break;
                 case QueueType.PublicBow:
                     mode = DuelMode.Bow;
                     break;
-                case QueueType.PublicRevolver:
-                    mode = DuelMode.Revolver;
+                case QueueType.PublicSpeargun:
+                    mode = DuelMode.Speargun;
                     break;
                 case QueueType.Public:
                 default:
-                    // Random mode for public queue
-                    var modes = new[] { DuelMode.AK47, DuelMode.SAR, DuelMode.Bow, DuelMode.Revolver };
-                    mode = modes[UnityEngine.Random.Range(0, modes.Length)];
+                    // Random mode for public queue — Speargun excluded (use dedicated Speargun queue)
+                    var modeList = new List<DuelMode> { DuelMode.AK47, DuelMode.SAR, DuelMode.Bow, DuelMode.Revolver };
+                    mode = modeList[UnityEngine.Random.Range(0, modeList.Count)];
                     break;
             }
             
             // Create the match using existing StartDuel method
-            StartDuel(player1, player2, mode);
+            StartDuel(player1, player2, mode, null, queueType);
+        }
+        
+        private void JoinCustomQueue(BasePlayer player, string kitName)
+        {
+            if (player == null) return;
+            
+            // Block if player is inside a private room
+            if (GetPlayerRoom(player.userID) != null)
+            {
+                SendReply(player, "You must leave your private room before joining a public queue!");
+                return;
+            }
+            
+            // Check if player is already in a match
+            if (activeMatches.Values.Any(d => d.Player1ID == player.userID || d.Player2ID == player.userID))
+            {
+                SendReply(player, "You're already in a match!");
+                return;
+            }
+            
+            // Check if already in this custom queue
+            string currentCustom = GetPlayerCustomQueue(player.userID);
+            if (currentCustom != null)
+            {
+                if (string.Equals(currentCustom, kitName, StringComparison.OrdinalIgnoreCase))
+                {
+                    SendReply(player, "You're already in this queue!");
+                    return;
+                }
+                LeaveQueueInternal(player, false);
+            }
+            else if (GetPlayerQueueType(player.userID).HasValue)
+            {
+                // In a regular typed queue — leave it first
+                LeaveQueueInternal(player, false);
+            }
+            
+            customQueuesByName[kitName].Add(player.userID);
+            SendReply(player, $"Joined {kitName} queue! Waiting for opponent...");
+            ShowLobbyBrowser(player);
+            ShowLeaveButton(player);
+        }
+        
+        private string GetPlayerCustomQueue(ulong playerID)
+        {
+            foreach (var kvp in customQueuesByName)
+            {
+                if (kvp.Value.Contains(playerID))
+                    return kvp.Key;
+            }
+            return null;
+        }
+        
+        private void TryMatchCustomQueue(string kitName)
+        {
+            if (!customQueuesByName.ContainsKey(kitName)) return;
+            var queue = customQueuesByName[kitName];
+            if (queue.Count < 2) return;
+            
+            var player1ID = queue[0];
+            var player2ID = queue[1];
+            var player1 = BasePlayer.FindByID(player1ID);
+            var player2 = BasePlayer.FindByID(player2ID);
+            
+            if (player1 == null || player2 == null)
+            {
+                if (player1 == null) queue.Remove(player1ID);
+                if (player2 == null) queue.Remove(player2ID);
+                return;
+            }
+            
+            queue.RemoveAt(0);
+            queue.RemoveAt(0);
+            
+            // Start the duel as a Custom-mode match with the kit name
+            StartDuel(player1, player2, DuelMode.Custom, null, null, kitName);
         }
         
         #endregion
         
         #region Phase 4 - Private Rooms
         
-        private void CreateRoom(BasePlayer player, string roomName)
+        private void CreateRoom(BasePlayer player, DuelMode mode = DuelMode.AK47, string customModeName = null)
         {
             if (player == null) return;
-            
-            // Validate room name
-            if (string.IsNullOrWhiteSpace(roomName) || roomName.Length < 3 || roomName.Length > 20)
-            {
-                SendReply(player, "Room name must be between 3 and 20 characters!");
-                return;
-            }
             
             // Check if player is already in a match
             if (activeMatches.Values.Any(d => d.Player1ID == player.userID || d.Player2ID == player.userID))
@@ -2269,209 +3656,376 @@ namespace Oxide.Plugins
                 return;
             }
             
-            // Check if player is already in a room
-            var existingRoom = GetPlayerRoom(player.userID);
-            if (existingRoom != null)
+            // Prevent duplicate rooms
+            if (privateRooms.Values.Any(r => r.OwnerID == player.userID))
             {
-                SendReply(player, "You're already in a room! Leave it first with /lobby.leaveroom");
+                SendReply(player, "You already own a room! Leave it first.");
                 return;
             }
             
-            // Generate unique room ID
-            string roomID;
-            do
+            // Prevent joining if already in another room
+            var existingRoom = GetPlayerRoom(player.userID);
+            if (existingRoom != null)
+            {
+                SendReply(player, "You're already in a room! Leave it first.");
+                return;
+            }
+            
+            // Generate unique short room ID (max 20 attempts before giving up)
+            string roomID = GenerateRoomID();
+            int idAttempts = 0;
+            while (privateRooms.ContainsKey(roomID) && idAttempts < 20)
             {
                 roomID = GenerateRoomID();
-            } while (privateRooms.ContainsKey(roomID));
+                idAttempts++;
+            }
+            if (privateRooms.ContainsKey(roomID))
+            {
+                SendReply(player, "Could not generate a unique room ID. Please try again.");
+                return;
+            }
             
-            // Create the room
+            // Room is named after the creator's display name, mode set at creation time
             var room = new PrivateRoom
             {
                 RoomID = roomID,
-                RoomName = roomName,
+                RoomName = player.displayName,
                 OwnerID = player.userID,
                 OwnerName = player.displayName,
                 PlayerIDs = new List<ulong> { player.userID },
-                MaxPlayers = 2,
-                Mode = DuelMode.AK47, // Default, can be changed
+                WaitingQueue = new List<ulong> { player.userID },
+                Mode = mode,
+                CustomModeName = customModeName,
                 Created = DateTime.Now
             };
             
             privateRooms[roomID] = room;
             
-            // Remove from queue if queued
+            // Remove from any public queue
             LeaveQueueInternal(player, false);
             
-            SendReply(player, $"Room '{roomName}' created with ID: {roomID}");
-            SendReply(player, $"Share this ID with friends: {roomID}");
-            SendReply(player, "Start match when 2 players with: /lobby.startmatch");
+            string modeStr = customModeName ?? (mode == DuelMode.Any ? "Random" : mode.ToString());
+            SendReply(player, $"Room created ({modeStr} mode)! Others can request to join from the lobby.");
             
-            // Update UI for all players
             UpdateRoomsList();
         }
         
-        private void JoinRoom(BasePlayer player, string roomID)
+        private void RequestJoinRoom(BasePlayer player, string roomID)
         {
             if (player == null || string.IsNullOrWhiteSpace(roomID)) return;
             
-            // Check if room exists
             if (!privateRooms.ContainsKey(roomID))
             {
-                SendReply(player, $"Room {roomID} does not exist!");
+                SendReply(player, "That room does not exist!");
                 return;
             }
             
             var room = privateRooms[roomID];
             
-            // Check if player is already in a match
             if (activeMatches.Values.Any(d => d.Player1ID == player.userID || d.Player2ID == player.userID))
             {
-                SendReply(player, "You cannot join a room while in a match!");
+                SendReply(player, "You cannot request to join a room while in a match!");
                 return;
             }
             
-            // Check if player is already in this room
-            if (room.PlayerIDs.Contains(player.userID))
+            if (room.HasPlayer(player.userID))
             {
                 SendReply(player, "You're already in this room!");
                 return;
             }
             
-            // Check if player is in another room
+            if (room.HasPendingRequest(player.userID))
+            {
+                SendReply(player, "You've already sent a join request to this room!");
+                return;
+            }
+            
             var existingRoom = GetPlayerRoom(player.userID);
             if (existingRoom != null)
             {
-                SendReply(player, "You're already in another room! Leave it first with /lobby.leaveroom");
+                SendReply(player, "You're already in another room! Leave it first.");
                 return;
             }
             
-            // Check if room is full
-            if (room.IsFull())
+            // Add to pending requests
+            room.PendingRequests[player.userID] = player.displayName;
+            
+            SendReply(player, $"Join request sent to {room.OwnerName}'s room. Waiting for approval (15s)...");
+            
+            // Notify owner via overlay UI (only if not in a match)
+            var owner = BasePlayer.FindByID(room.OwnerID);
+            if (owner != null && owner.IsConnected)
             {
-                SendReply(player, $"Room '{room.RoomName}' is full!");
-                return;
+                ShowJoinRequestUI(owner, roomID);
             }
             
-            // Remove from queue if queued
-            LeaveQueueInternal(player, false);
+            // Update the lobby for all (shows PENDING state on the button for requester)
+            UpdateRoomsList();
             
-            // Add player to room
-            room.PlayerIDs.Add(player.userID);
-            
-            SendReply(player, $"Joined room '{room.RoomName}' ({room.PlayerIDs.Count}/{room.MaxPlayers})");
-            
-            // Notify all room members
-            foreach (var playerID in room.PlayerIDs)
+            // Auto-decline after 15 seconds if owner hasn't responded
+            ulong requesterID = player.userID;
+            timer.Once(15f, () =>
             {
-                var p = BasePlayer.FindByID(playerID);
-                if (p != null && p.userID != player.userID)
+                // Access through dictionary (not captured reference) to avoid stale-object issues
+                if (privateRooms.ContainsKey(roomID) &&
+                    privateRooms[roomID].PendingRequests.ContainsKey(requesterID))
                 {
-                    SendReply(p, $"{player.displayName} joined your room");
+                    DeclineJoinRequest(privateRooms[roomID].OwnerID, requesterID, roomID);
+                }
+            });
+        }
+        
+        private void AcceptJoinRequest(BasePlayer owner, ulong requesterID, string roomID)
+        {
+            if (owner == null || !privateRooms.ContainsKey(roomID)) return;
+            var room = privateRooms[roomID];
+            
+            if (owner.userID != room.OwnerID)
+            {
+                SendReply(owner, "You are not the owner of this room!");
+                return;
+            }
+            
+            if (!room.PendingRequests.ContainsKey(requesterID))
+            {
+                // Request may have already timed out
+                DestroyJoinRequestUI(owner);
+                ShowJoinRequestUI(owner, roomID);
+                return;
+            }
+            
+            string requesterName = room.PendingRequests[requesterID];
+            room.PendingRequests.Remove(requesterID);
+            
+            var requester = BasePlayer.FindByID(requesterID);
+            if (requester == null || !requester.IsConnected)
+            {
+                SendReply(owner, $"{requesterName} is no longer online.");
+                DestroyJoinRequestUI(owner);
+                ShowJoinRequestUI(owner, roomID);
+                return;
+            }
+            
+            // Remove from any public queue
+            LeaveQueueInternal(requester, false);
+            
+            // Add to room
+            room.PlayerIDs.Add(requesterID);
+            room.WaitingQueue.Add(requesterID);
+            
+            SendReply(owner, $"Accepted {requesterName} into your room!");
+            SendReply(requester, $"Your join request was accepted! Welcome to {room.RoomName}'s room.");
+            
+            // Notify other room members
+            foreach (var pid in room.PlayerIDs)
+            {
+                if (pid != owner.userID && pid != requesterID)
+                {
+                    var p = BasePlayer.FindByID(pid);
+                    if (p != null && p.IsConnected)
+                        SendReply(p, $"{requesterName} joined the room.");
                 }
             }
             
-            // Update UI for all players
+            // Refresh request UI (show next pending request or hide if none left)
+            DestroyJoinRequestUI(owner);
+            ShowJoinRequestUI(owner, roomID);
+            
+            // Auto-start match when 2+ players are waiting
+            TryRoomMatchmaking(roomID);
+            
+            UpdateRoomsList();
+        }
+        
+        private void DeclineJoinRequest(ulong ownerID, ulong requesterID, string roomID)
+        {
+            if (!privateRooms.ContainsKey(roomID)) return;
+            var room = privateRooms[roomID];
+            
+            if (!room.PendingRequests.ContainsKey(requesterID)) return;
+            
+            string requesterName = room.PendingRequests[requesterID];
+            room.PendingRequests.Remove(requesterID);
+            
+            var requester = BasePlayer.FindByID(requesterID);
+            if (requester != null && requester.IsConnected)
+                SendReply(requester, $"Your join request to {room.RoomName}'s room was declined.");
+            
+            var owner = BasePlayer.FindByID(ownerID);
+            if (owner != null && owner.IsConnected)
+            {
+                // Refresh request UI (show remaining requests)
+                DestroyJoinRequestUI(owner);
+                ShowJoinRequestUI(owner, roomID);
+            }
+            
+            UpdateRoomsList();
+        }
+        
+        private void TryRoomMatchmaking(string roomID, int depth = 0)
+        {
+            // Guard against infinite recursion when all waiting players are offline
+            if (depth > 10) return;
+            
+            if (!privateRooms.ContainsKey(roomID)) return;
+            var room = privateRooms[roomID];
+            
+            // Clean disconnected players from waiting queue upfront
+            room.WaitingQueue.RemoveAll(id =>
+            {
+                var p = BasePlayer.FindByID(id);
+                return p == null || !p.IsConnected;
+            });
+            
+            if (room.WaitingQueue.Count < 2) return;
+            
+            var p1ID = room.WaitingQueue[0];
+            var p2ID = room.WaitingQueue[1];
+            room.WaitingQueue.RemoveAt(0);
+            room.WaitingQueue.RemoveAt(0);
+            
+            var p1 = BasePlayer.FindByID(p1ID);
+            var p2 = BasePlayer.FindByID(p2ID);
+            
+            // Both were already cleaned above; if somehow still null, retry with next pair
+            if (p1 == null || !p1.IsConnected || p2 == null || !p2.IsConnected)
+            {
+                if (p1 != null && p1.IsConnected) room.WaitingQueue.Insert(0, p1ID);
+                if (p2 != null && p2.IsConnected) room.WaitingQueue.Insert(0, p2ID);
+                TryRoomMatchmaking(roomID, depth + 1);
+                return;
+            }
+            
+            // Start the duel using the room's chosen mode; resolve Any to a random concrete mode
+            DuelMode duelMode = room.Mode;
+            if (duelMode == DuelMode.Any)
+            {
+                var randomModes = new List<DuelMode> { DuelMode.AK47, DuelMode.SAR, DuelMode.Bow, DuelMode.Revolver };
+                duelMode = randomModes[UnityEngine.Random.Range(0, randomModes.Count)];
+            }
+            StartDuel(p1, p2, duelMode, roomID, null, duelMode == DuelMode.Custom ? room.CustomModeName : null);
+        }
+        
+        private void SetRoomMode(BasePlayer player, string roomID, string modeName)
+        {
+            if (!privateRooms.ContainsKey(roomID)) return;
+            var room = privateRooms[roomID];
+            
+            if (room.OwnerID != player.userID)
+            {
+                SendReply(player, "Only the room owner can change the weapon mode!");
+                return;
+            }
+            
+            DuelMode mode;
+            string customName = null;
+            switch (modeName.ToUpper())
+            {
+                case "AK47":    mode = DuelMode.AK47;     break;
+                case "SAR":     mode = DuelMode.SAR;      break;
+                case "BOW":     mode = DuelMode.Bow;      break;
+                case "REVOLVER":mode = DuelMode.Revolver; break;
+                case "RANDOM":
+                case "ANY":     mode = DuelMode.Any;      break;
+                case "SPEARGUN":
+                    if (!config.EnableSpeargun)
+                    {
+                        SendReply(player, "Speargun mode is disabled on this server!");
+                        return;
+                    }
+                    mode = DuelMode.Speargun;
+                    break;
+                default:
+                    // Check if it matches a custom loadout name (case-insensitive)
+                    var match = config.Loadouts.Keys.FirstOrDefault(k =>
+                        string.Equals(k, modeName, StringComparison.OrdinalIgnoreCase));
+                    if (match != null)
+                    {
+                        mode = DuelMode.Custom;
+                        customName = match;
+                    }
+                    else
+                    {
+                        SendReply(player, "Invalid mode! Available modes: " +
+                            string.Join(", ", config.Loadouts.Keys));
+                        return;
+                    }
+                    break;
+            }
+            
+            room.Mode = mode;
+            room.CustomModeName = customName;
+            string displayName = customName ?? mode.ToString();
+            SendReply(player, $"Room weapon mode set to {displayName}!");
+            
+            // Refresh gun select UI to show updated selection
+            ShowGunSelectUI(player, roomID);
             UpdateRoomsList();
         }
         
         private void LeaveRoom(BasePlayer player, string roomID, bool updateUI = true)
         {
             if (player == null || string.IsNullOrWhiteSpace(roomID)) return;
-            
             if (!privateRooms.ContainsKey(roomID)) return;
             
             var room = privateRooms[roomID];
-            
             if (!room.PlayerIDs.Contains(player.userID)) return;
             
-            // Remove player from room
             room.PlayerIDs.Remove(player.userID);
+            room.WaitingQueue.Remove(player.userID);
             
-            SendReply(player, $"Left room '{room.RoomName}'");
+            // Cancel any pending requests this player sent to THIS room
+            if (room.PendingRequests.ContainsKey(player.userID))
+                room.PendingRequests.Remove(player.userID);
             
-            // Notify remaining players
-            foreach (var playerID in room.PlayerIDs)
+            SendReply(player, $"Left {room.RoomName}'s room.");
+            
+            // Close gun select UI if open
+            CuiHelper.DestroyUi(player, "RoomGunSelect");
+            DestroyJoinRequestUI(player);
+            
+            // Notify remaining members
+            foreach (var pid in room.PlayerIDs)
             {
-                var p = BasePlayer.FindByID(playerID);
-                if (p != null)
-                {
-                    SendReply(p, $"{player.displayName} left the room");
-                }
+                var p = BasePlayer.FindByID(pid);
+                if (p != null && p.IsConnected)
+                    SendReply(p, $"{player.displayName} left the room.");
             }
             
-            // Handle owner leaving
-            if (player.userID == room.OwnerID && room.PlayerIDs.Count > 0)
+            if (player.userID == room.OwnerID)
             {
-                // Transfer ownership to next player
-                room.OwnerID = room.PlayerIDs[0];
-                var newOwner = BasePlayer.FindByID(room.OwnerID);
-                if (newOwner != null)
+                if (room.PlayerIDs.Count > 0)
                 {
-                    room.OwnerName = newOwner.displayName;
-                    SendReply(newOwner, "You are now the room owner");
+                    // Transfer ownership
+                    room.OwnerID = room.PlayerIDs[0];
+                    var newOwner = BasePlayer.FindByID(room.OwnerID);
+                    if (newOwner != null)
+                    {
+                        room.OwnerName = newOwner.displayName;
+                        SendReply(newOwner, "You are now the room owner.");
+                        // Show any pending requests to new owner
+                        if (room.PendingRequests.Count > 0)
+                            ShowJoinRequestUI(newOwner, roomID);
+                    }
+                }
+                else
+                {
+                    // No one left — decline all pending requests and close the room
+                    foreach (var kvp in room.PendingRequests)
+                    {
+                        var requester = BasePlayer.FindByID(kvp.Key);
+                        if (requester != null && requester.IsConnected)
+                            SendReply(requester, $"{room.RoomName}'s room has been closed.");
+                    }
+                    privateRooms.Remove(roomID);
                 }
             }
-            
-            // Close room if empty
-            if (room.PlayerIDs.Count == 0)
+            else if (room.PlayerIDs.Count == 0)
             {
                 privateRooms.Remove(roomID);
             }
             
-            if (updateUI)
-            {
-                UpdateRoomsList();
-            }
-        }
-        
-        private void StartRoomMatch(BasePlayer owner, string roomID)
-        {
-            if (owner == null || string.IsNullOrWhiteSpace(roomID)) return;
-            
-            if (!privateRooms.ContainsKey(roomID))
-            {
-                SendReply(owner, "Room does not exist!");
-                return;
-            }
-            
-            var room = privateRooms[roomID];
-            
-            // Check if player is the owner
-            if (owner.userID != room.OwnerID)
-            {
-                SendReply(owner, "Only the room owner can start the match!");
-                return;
-            }
-            
-            // Check if room has exactly 2 players
-            if (room.PlayerIDs.Count != 2)
-            {
-                SendReply(owner, $"Need exactly 2 players to start! ({room.PlayerIDs.Count}/2)");
-                return;
-            }
-            
-            // Get both players
-            var player1 = BasePlayer.FindByID(room.PlayerIDs[0]);
-            var player2 = BasePlayer.FindByID(room.PlayerIDs[1]);
-            
-            if (player1 == null || player2 == null)
-            {
-                SendReply(owner, "One or more players are not available!");
-                return;
-            }
-            
-            // Select random mode
-            var modes = new[] { DuelMode.AK47, DuelMode.SAR, DuelMode.Bow, DuelMode.Revolver };
-            var mode = modes[UnityEngine.Random.Range(0, modes.Length)];
-            
-            // Start the match
-            StartDuel(player1, player2, mode);
-            
-            // Close the room
-            privateRooms.Remove(roomID);
-            
-            // Update UI
-            UpdateRoomsList();
+            if (updateUI) UpdateRoomsList();
         }
         
         private string GetPlayerRoom(ulong playerID)
@@ -2479,9 +4033,17 @@ namespace Oxide.Plugins
             foreach (var room in privateRooms.Values)
             {
                 if (room.PlayerIDs.Contains(playerID))
-                {
                     return room.RoomID;
-                }
+            }
+            return null;
+        }
+        
+        private string GetOwnedRoom(ulong playerID)
+        {
+            foreach (var room in privateRooms.Values)
+            {
+                if (room.OwnerID == playerID)
+                    return room.RoomID;
             }
             return null;
         }
@@ -2490,42 +4052,60 @@ namespace Oxide.Plugins
         {
             var roomsToRemove = new List<string>();
             
+            // Cancel any pending requests this player sent to any room
             foreach (var room in privateRooms.Values)
             {
-                if (room.PlayerIDs.Contains(playerID))
+                if (room.PendingRequests.ContainsKey(playerID))
                 {
-                    room.PlayerIDs.Remove(playerID);
-                    
-                    // Handle owner leaving
-                    if (playerID == room.OwnerID && room.PlayerIDs.Count > 0)
+                    room.PendingRequests.Remove(playerID);
+                    // Refresh owner's request UI
+                    var owner = BasePlayer.FindByID(room.OwnerID);
+                    if (owner != null && owner.IsConnected)
                     {
-                        room.OwnerID = room.PlayerIDs[0];
-                        var newOwner = BasePlayer.FindByID(room.OwnerID);
-                        if (newOwner != null)
-                        {
-                            room.OwnerName = newOwner.displayName;
-                            SendReply(newOwner, "You are now the room owner");
-                        }
-                    }
-                    
-                    // Mark for removal if empty
-                    if (room.PlayerIDs.Count == 0)
-                    {
-                        roomsToRemove.Add(room.RoomID);
+                        DestroyJoinRequestUI(owner);
+                        ShowJoinRequestUI(owner, room.RoomID);
                     }
                 }
             }
             
-            // Remove empty rooms
-            foreach (var roomID in roomsToRemove)
+            foreach (var room in privateRooms.Values)
             {
-                privateRooms.Remove(roomID);
+                if (!room.PlayerIDs.Contains(playerID)) continue;
+                
+                room.PlayerIDs.Remove(playerID);
+                room.WaitingQueue.Remove(playerID);
+                
+                if (playerID == room.OwnerID && room.PlayerIDs.Count > 0)
+                {
+                    room.OwnerID = room.PlayerIDs[0];
+                    var newOwner = BasePlayer.FindByID(room.OwnerID);
+                    if (newOwner != null)
+                    {
+                        room.OwnerName = newOwner.displayName;
+                        SendReply(newOwner, "You are now the room owner.");
+                        if (room.PendingRequests.Count > 0)
+                            ShowJoinRequestUI(newOwner, room.RoomID);
+                    }
+                }
+                
+                if (room.PlayerIDs.Count == 0)
+                {
+                    // Decline pending requests before closing
+                    foreach (var kvp in room.PendingRequests)
+                    {
+                        var requester = BasePlayer.FindByID(kvp.Key);
+                        if (requester != null && requester.IsConnected)
+                            SendReply(requester, $"The room you requested to join has been closed.");
+                    }
+                    roomsToRemove.Add(room.RoomID);
+                }
             }
             
+            foreach (var rid in roomsToRemove)
+                privateRooms.Remove(rid);
+            
             if (roomsToRemove.Count > 0)
-            {
                 UpdateRoomsList();
-            }
         }
         
         private void UpdateRoomsList()
@@ -2533,9 +4113,7 @@ namespace Oxide.Plugins
             foreach (var player in BasePlayer.activePlayerList)
             {
                 if (player != null && player.IsConnected)
-                {
                     ShowLobbyBrowser(player);
-                }
             }
         }
         
@@ -2553,109 +4131,154 @@ namespace Oxide.Plugins
         {
             if (player == null) return;
             
-            DestroyLeaderboardUI(player); // Clean up any existing leaderboard UI
+            DestroyLeaderboardUI(player);
+            
+            // Determine context from the player's current match, defaulting to Public for lobby
+            string queueKey = "Public";
+            ulong otherPlayerID = 0;
+            if (activeMatches.ContainsKey(player.userID))
+            {
+                var match = activeMatches[player.userID];
+                queueKey = GetMatchQueueKey(match);
+                otherPlayerID = match.Player1ID == player.userID ? match.Player2ID : match.Player1ID;
+            }
             
             var elements = new CuiElementContainer();
             
-            // Main panel - top left corner (narrower with bigger text)
+            // Main panel - anchored to the true top-left corner, tall enough for 10 entries + footer.
             var mainPanel = elements.Add(new CuiPanel
             {
-                Image = { Color = "0.1 0.1 0.1 0.85" },
-                RectTransform = { AnchorMin = "0.01 0.70", AnchorMax = "0.19 0.99" },
+                Image = { Color = "0.17 0.17 0.17 0.95" },
+                RectTransform = { AnchorMin = "0.01 0.60", AnchorMax = "0.20 1.0" },
                 CursorEnabled = false
             }, "Hud", "LeaderboardUI");
             
-            // Title
+            // Title background strip - named so labels can be parented to it,
+            // ensuring they always render above the background panel.
+            // Strip occupies top 16% of panel (~40 px at 812 p screen) so both labels
+            // have enough height: font-size must be ≤ ~70% of the box height to render.
+            elements.Add(new CuiPanel
+            {
+                Image = { Color = "0 0.8 0.82 0.25" },
+                RectTransform = { AnchorMin = "0 0.84", AnchorMax = "1 1" }
+            }, mainPanel, "LB.TitleBg");
+            
+            // Title label - queue name, upper 49% of strip (~20 px), font 13 = 65% of box ✓
+            string titleText = queueKey == "Private"  ? "PRIVATE" :
+                               queueKey == "AK"       ? "PUBLIC AK47" :
+                               queueKey == "Bow"      ? "PUBLIC BOW" :
+                               queueKey == "Speargun" ? "PUBLIC SPEARGUN" :
+                                                        "PUBLIC";
             elements.Add(new CuiLabel
             {
-                Text = { Text = "🏆 GLOBAL LEADERBOARD", FontSize = 16, Align = TextAnchor.UpperCenter, Color = "1 0.8 0 1" },
-                RectTransform = { AnchorMin = "0.05 0.92", AnchorMax = "0.95 0.98" }
+                Text = { Text = titleText, FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" },
+                RectTransform = { AnchorMin = "0.03 0.48", AnchorMax = "0.97 0.97" }
+            }, "LB.TitleBg");
+            
+            // Sub-label "Last N min" - lower 45% of strip (~18 px), font 9 = 50% of box ✓
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = $"Last {config.LeaderboardTimeWindowMinutes} min", FontSize = 9, Align = TextAnchor.MiddleCenter, Color = "0.7 0.7 0.7 1" },
+                RectTransform = { AnchorMin = "0.03 0.03", AnchorMax = "0.97 0.48" }
+            }, "LB.TitleBg");
+            
+            // Separator sits just below the strip bottom (strip AnchorMin y=0.84 in panel)
+            elements.Add(new CuiPanel
+            {
+                Image = { Color = "0 0.8 0.82 0.5" },
+                RectTransform = { AnchorMin = "0.03 0.836", AnchorMax = "0.97 0.841" }
             }, mainPanel);
             
-            // Get top 10 players - Filter by time window (last X minutes)
+            // ---- Leaderboard entries ----
             var cutoffTime = DateTime.Now.AddMinutes(-config.LeaderboardTimeWindowMinutes);
-            var topPlayers = playerData
-                .Where(p => p.Value.LastMatchTime >= cutoffTime) // Only show players with recent matches
-                .OrderByDescending(p => p.Value.WinRate)
-                .ThenByDescending(p => p.Value.Wins)
-                .Take(10)
-                .ToList();
             
-            // Display leaderboard entries
-            float startY = 0.88f;
-            float entryHeight = 0.08f;
-            int rank = 1;
+            List<KeyValuePair<ulong, PlayerData>> topPlayers;
+            if (queueKey == "Private" && otherPlayerID != 0)
+            {
+                // Private match: only show this match's two participants, sorted by recent wins
+                topPlayers = playerData
+                    .Where(p => p.Key == player.userID || p.Key == otherPlayerID)
+                    .OrderByDescending(p => GetRecentWinsByQueue(p.Value, "Private", config.LeaderboardTimeWindowMinutes))
+                    .ThenByDescending(p => GetRecentWinRateByQueue(p.Value, "Private", config.LeaderboardTimeWindowMinutes))
+                    .ToList();
+            }
+            else
+            {
+                topPlayers = playerData
+                    .Where(p => p.Value.StatEvents.Any(e => (e.Type == "Win" || e.Type == "Loss")
+                                                         && e.QueueKey == queueKey
+                                                         && e.Timestamp >= cutoffTime))
+                    .OrderByDescending(p => GetRecentWinsByQueue(p.Value, queueKey, config.LeaderboardTimeWindowMinutes))
+                    .ThenByDescending(p => GetRecentWinRateByQueue(p.Value, queueKey, config.LeaderboardTimeWindowMinutes))
+                    .Take(10)
+                    .ToList();
+            }
+            
+            float startY      = 0.825f;
+            float entryHeight = 0.075f;
+            int   rank        = 1;
             
             if (topPlayers.Count == 0)
             {
-                // No recent matches - show message
                 elements.Add(new CuiLabel
                 {
-                    Text = { Text = $"No matches in the\nlast {config.LeaderboardTimeWindowMinutes} minutes", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = "0.8 0.8 0.8 1" },
+                    Text = { Text = $"No {queueKey} matches\nin the last {config.LeaderboardTimeWindowMinutes} min",
+                             FontSize = 11, Align = TextAnchor.MiddleCenter, Color = "0.6 0.6 0.6 1" },
                     RectTransform = { AnchorMin = "0.05 0.40", AnchorMax = "0.95 0.60" }
                 }, mainPanel);
             }
             
             foreach (var entry in topPlayers)
             {
-                var playerName = covalence.Players.FindPlayerById(entry.Key.ToString())?.Name ?? "Unknown";
-                if (playerName.Length > 12) playerName = playerName.Substring(0, 12); // Truncate long names
+                var   playerName = covalence.Players.FindPlayerById(entry.Key.ToString())?.Name ?? "Unknown";
+                if (playerName.Length > 12) playerName = playerName.Substring(0, 12);
                 
-                var stats = entry.Value;
+                int   w    = GetRecentWinsByQueue(entry.Value, queueKey, config.LeaderboardTimeWindowMinutes);
+                int   l    = GetRecentLossesByQueue(entry.Value, queueKey, config.LeaderboardTimeWindowMinutes);
+                float wr   = GetRecentWinRateByQueue(entry.Value, queueKey, config.LeaderboardTimeWindowMinutes);
+                string txt = $"{rank}. {playerName}  {w}W-{l}L ({wr:F0}%)";
                 
-                // Calculate K/D ratio from rolling stats (last X minutes only)
-                int recentKills = GetRecentKills(stats, config.LeaderboardTimeWindowMinutes);
-                int recentDeaths = GetRecentDeaths(stats, config.LeaderboardTimeWindowMinutes);
-                float kd = recentDeaths > 0 ? (float)recentKills / recentDeaths : recentKills;
-                
-                // Get recent wins/losses for display
-                int recentWins = GetRecentWins(stats, config.LeaderboardTimeWindowMinutes);
-                int recentLosses = GetRecentLosses(stats, config.LeaderboardTimeWindowMinutes);
-                
-                string entryText = $"{rank}. {playerName} ({recentWins}-{recentLosses}) K/D: {kd:F2}";
-                
-                // Highlight current player
-                string textColor = (entry.Key == player.userID) ? "1 1 0 1" : "0.9 0.9 0.9 1";
+                string textColor = entry.Key == player.userID ? "1 1 0 1" : "0.9 0.9 0.9 1";
                 
                 elements.Add(new CuiLabel
                 {
-                    Text = { Text = entryText, FontSize = 12, Align = TextAnchor.UpperLeft, Color = textColor },
-                    RectTransform = { AnchorMin = $"0.05 {startY - entryHeight}", AnchorMax = $"0.95 {startY}" }
+                    Text = { Text = txt, FontSize = 11, Align = TextAnchor.UpperLeft, Color = textColor },
+                    RectTransform = { AnchorMin = $"0.05 {startY - entryHeight:F3}", AnchorMax = $"0.95 {startY:F3}" }
                 }, mainPanel);
                 
                 startY -= entryHeight;
                 rank++;
-                
-                if (rank > 10) break; // Only show top 10
+                if (rank > 10) break;
             }
             
-            // Footer with player's rank if not in top 10
-            if (playerData.ContainsKey(player.userID))
+            // Footer: show viewer's own rank when outside top 10 (public queues only)
+            if (queueKey != "Private" && playerData.ContainsKey(player.userID))
             {
-                var playerRank = playerData
-                    .Where(p => p.Value.LastMatchTime >= cutoffTime) // Use same time filter
-                    .OrderByDescending(p => p.Value.WinRate)
-                    .ThenByDescending(p => p.Value.Wins)
-                    .ToList()
-                    .FindIndex(p => p.Key == player.userID) + 1;
+                var yourData = playerData[player.userID];
+                int yourW = GetRecentWinsByQueue(yourData, queueKey, config.LeaderboardTimeWindowMinutes);
+                int yourL = GetRecentLossesByQueue(yourData, queueKey, config.LeaderboardTimeWindowMinutes);
                 
-                if (playerRank > 10)
+                if (yourW > 0 || yourL > 0)
                 {
-                    var yourStats = playerData[player.userID];
-                    // Calculate from rolling stats
-                    int yourRecentKills = GetRecentKills(yourStats, config.LeaderboardTimeWindowMinutes);
-                    int yourRecentDeaths = GetRecentDeaths(yourStats, config.LeaderboardTimeWindowMinutes);
-                    float yourKd = yourRecentDeaths > 0 ? (float)yourRecentKills / yourRecentDeaths : yourRecentKills;
+                    int yourRank = playerData
+                        .Where(p => p.Value.StatEvents.Any(e => (e.Type == "Win" || e.Type == "Loss")
+                                                             && e.QueueKey == queueKey
+                                                             && e.Timestamp >= cutoffTime))
+                        .OrderByDescending(p => GetRecentWinsByQueue(p.Value, queueKey, config.LeaderboardTimeWindowMinutes))
+                        .ThenByDescending(p => GetRecentWinRateByQueue(p.Value, queueKey, config.LeaderboardTimeWindowMinutes))
+                        .ToList()
+                        .FindIndex(p => p.Key == player.userID) + 1;
                     
-                    int yourRecentWins = GetRecentWins(yourStats, config.LeaderboardTimeWindowMinutes);
-                    int yourRecentLosses = GetRecentLosses(yourStats, config.LeaderboardTimeWindowMinutes);
-                    string footerText = $"Your Rank: #{playerRank}\n{yourRecentWins}W-{yourRecentLosses}L | K/D: {yourKd:F2}";
-                    
-                    elements.Add(new CuiLabel
+                    if (yourRank > 10)
                     {
-                        Text = { Text = footerText, FontSize = 11, Align = TextAnchor.LowerCenter, Color = "1 1 0 1" },
-                        RectTransform = { AnchorMin = "0.05 0.02", AnchorMax = "0.95 0.10" }
-                    }, mainPanel);
+                        float yourWr = GetRecentWinRateByQueue(yourData, queueKey, config.LeaderboardTimeWindowMinutes);
+                        elements.Add(new CuiLabel
+                        {
+                            Text = { Text = $"Your rank: #{yourRank}  {yourW}W-{yourL}L ({yourWr:F0}%)",
+                                     FontSize = 10, Align = TextAnchor.MiddleCenter, Color = "1 1 0 1" },
+                            RectTransform = { AnchorMin = "0.03 0.01", AnchorMax = "0.97 0.07" }
+                        }, mainPanel);
+                    }
                 }
             }
             
@@ -2724,8 +4347,8 @@ namespace Oxide.Plugins
             
             CuiHelper.AddUi(player, elements);
             
-            // Auto-destroy after 5 seconds
-            timer.Once(1f, () => DestroyWinLoseUI(player));
+            // Auto-dismiss after 2 seconds
+            timer.Once(2f, () => DestroyWinLoseUI(player));
         }
         
         private void DestroyWinLoseUI(BasePlayer player)
@@ -2757,14 +4380,17 @@ namespace Oxide.Plugins
             SendReply(player, $"Creating arena '{name}'.\n" +
                              "Step 1: Move to the first spawn point and use /arena setspawn1\n" +
                              "Step 2: Move to the second spawn point and use /arena setspawn2\n" +
-                             "Step 3: Use /arena save to save the arena");
+                             "Step 3: (Optional) Use /arena setradius <radius> to adjust the zone size (default: 30m)\n" +
+                             "Step 4: (Optional) Move to the lobby position and use /arena setlobbyspawn\n" +
+                             "Step 5: (Optional) Use /arena setlobbyradius <radius> to adjust the lobby zone size (default: 10m)\n" +
+                             "Step 6: Use /arena save to save the arena");
         }
         
         private void SetSpawn1(BasePlayer player)
         {
             if (!arenaBuilders.ContainsKey(player.userID))
             {
-                SendReply(player, "You're not creating an arena. Use /arena create <name> first.");
+                SendReply(player, "You're not in a builder session. Use /arena create <name> or /arena edit <name> first.");
                 return;
             }
             
@@ -2772,13 +4398,14 @@ namespace Oxide.Plugins
             builder.Spawn1 = player.transform.position;
             SendReply(player, $"Spawn point 1 set at {builder.Spawn1}\n" +
                              "Now move to the second spawn point and use /arena setspawn2");
+            StartBuilderVisualization(player, builder);
         }
         
         private void SetSpawn2(BasePlayer player)
         {
             if (!arenaBuilders.ContainsKey(player.userID))
             {
-                SendReply(player, "You're not creating an arena. Use /arena create <name> first.");
+                SendReply(player, "You're not in a builder session. Use /arena create <name> or /arena edit <name> first.");
                 return;
             }
             
@@ -2793,13 +4420,15 @@ namespace Oxide.Plugins
             builder.Spawn2 = player.transform.position;
             SendReply(player, $"Spawn point 2 set at {builder.Spawn2}\n" +
                              "Arena is ready! Use /arena save to save it.");
+            // Restart visualization so it now also draws spawn2 and the full zone
+            StartBuilderVisualization(player, builder);
         }
         
         private void SaveArena(BasePlayer player)
         {
             if (!arenaBuilders.ContainsKey(player.userID))
             {
-                SendReply(player, "You're not creating an arena. Use /arena create <name> first.");
+                SendReply(player, "You're not in a builder session. Use /arena create <name> or /arena edit <name> first.");
                 return;
             }
             
@@ -2812,25 +4441,60 @@ namespace Oxide.Plugins
                 return;
             }
             
-            // Add to configuration
-            var arenaConfig = new ArenaConfig
+            bool lobbySet = builder.LobbySpawn != Vector3.zero;
+            
+            if (builder.IsEditing)
             {
-                Name = builder.Name,
-                Spawn1 = builder.Spawn1,
-                Spawn2 = builder.Spawn2
-            };
+                // Update the existing ArenaConfig entry
+                var existingConfig = arenas.FirstOrDefault(a =>
+                    a.Name.Equals(builder.Name, StringComparison.OrdinalIgnoreCase));
+                if (existingConfig == null)
+                {
+                    SendReply(player, $"Error: Arena '{builder.Name}' not found in data. Aborting.");
+                    StopBuilderVisualization(builder);
+                    arenaBuilders.Remove(player.userID);
+                    return;
+                }
+                existingConfig.Spawn1 = builder.Spawn1;
+                existingConfig.Spawn2 = builder.Spawn2;
+                existingConfig.Radius = builder.Radius;
+                existingConfig.LobbyPosition = builder.LobbySpawn;
+                existingConfig.LobbyRadius = builder.LobbyRadius;
+                existingConfig.LobbyPositionSet = lobbySet;
+                SaveArenas();
+                arenaManager.UpdateArena(existingConfig);
+                
+                string lobbyMsg = lobbySet ? $"\nLobby: {builder.LobbySpawn} r={builder.LobbyRadius}m" : "";
+                SendReply(player, $"Arena '{builder.Name}' updated successfully!\n" +
+                                 $"Spawn 1: {builder.Spawn1}\n" +
+                                 $"Spawn 2: {builder.Spawn2}\n" +
+                                 $"Zone radius: {builder.Radius}m" + lobbyMsg);
+            }
+            else
+            {
+                // Create a new ArenaConfig
+                var arenaConfig = new ArenaConfig
+                {
+                    Name = builder.Name,
+                    Spawn1 = builder.Spawn1,
+                    Spawn2 = builder.Spawn2,
+                    Radius = builder.Radius,
+                    LobbyPosition = builder.LobbySpawn,
+                    LobbyRadius = builder.LobbyRadius,
+                    LobbyPositionSet = lobbySet
+                };
+                arenas.Add(arenaConfig);
+                SaveArenas();
+                arenaManager.AddArena(arenaConfig);
+                
+                string lobbyMsg = lobbySet ? $"\nLobby: {builder.LobbySpawn} r={builder.LobbyRadius}m" : "";
+                SendReply(player, $"Arena '{builder.Name}' saved successfully!\n" +
+                                 $"Spawn 1: {builder.Spawn1}\n" +
+                                 $"Spawn 2: {builder.Spawn2}\n" +
+                                 $"Zone radius: {builder.Radius}m" + lobbyMsg);
+            }
             
-            // Add to arena list
-            arenas.Add(arenaConfig);
-            SaveArenas(); // Save arenas to data file
-            
-            // Add to arena manager
-            arenaManager.AddArena(arenaConfig);
-            
-            SendReply(player, $"Arena '{builder.Name}' saved successfully!\n" +
-                             $"Spawn 1: {builder.Spawn1}\n" +
-                             $"Spawn 2: {builder.Spawn2}");
-            
+            StopBuilderVisualization(builder);
             arenaBuilders.Remove(player.userID);
         }
         
@@ -2838,13 +4502,225 @@ namespace Oxide.Plugins
         {
             if (!arenaBuilders.ContainsKey(player.userID))
             {
-                SendReply(player, "You're not creating an arena.");
+                SendReply(player, "You're not in a builder session.");
                 return;
             }
             
             var builder = arenaBuilders[player.userID];
+            StopBuilderVisualization(builder);
             arenaBuilders.Remove(player.userID);
-            SendReply(player, $"Cancelled creation of arena '{builder.Name}'");
+            string action = builder.IsEditing ? "Cancelled editing" : "Cancelled creation";
+            SendReply(player, $"{action} of arena '{builder.Name}'");
+        }
+        
+        private void EditArena(BasePlayer player, string name)
+        {
+            if (arenaBuilders.ContainsKey(player.userID))
+            {
+                SendReply(player, "You're already in a builder session. Use /arena cancel first.");
+                return;
+            }
+            
+            var arena = arenaManager.GetArenaByName(name);
+            if (arena == null)
+            {
+                SendReply(player, $"Arena '{name}' not found.");
+                return;
+            }
+            
+            if (arenaManager.IsArenaInUse(name))
+            {
+                SendReply(player, $"Arena '{name}' is currently in use. Cannot edit.");
+                return;
+            }
+            
+            string lobbyInfo = arena.LobbyPositionSet
+                ? $"\nLobby spawn: {arena.LobbyPosition} r={arena.LobbyRadius}m"
+                : "\nNo lobby spawn set";
+            
+            arenaBuilders[player.userID] = new ArenaBuilder
+            {
+                Name = arena.Name,
+                Spawn1 = arena.Spawn1,
+                Spawn2 = arena.Spawn2,
+                Radius = arena.Radius,
+                LobbySpawn = arena.LobbyPositionSet ? arena.LobbyPosition : Vector3.zero,
+                LobbyRadius = arena.LobbyRadius,
+                IsEditing = true
+            };
+            
+            StartBuilderVisualization(player, arenaBuilders[player.userID]);
+            
+            SendReply(player, $"Editing arena '{name}'.\n" +
+                             $"Spawn 1: {arena.Spawn1}\n" +
+                             $"Spawn 2: {arena.Spawn2}\n" +
+                             $"Zone radius: {arena.Radius}m" + lobbyInfo + "\n" +
+                             "Use /arena setspawn1, /arena setspawn2, /arena setradius, /arena setlobbyspawn, /arena setlobbyradius to adjust.\n" +
+                             "Use /arena save to save or /arena cancel to discard changes.");
+        }
+        
+        private void SetLobbySpawn(BasePlayer player)
+        {
+            if (!arenaBuilders.ContainsKey(player.userID))
+            {
+                SendReply(player, "You're not in a builder session. Use /arena create <name> or /arena edit <name> first.");
+                return;
+            }
+            
+            var builder = arenaBuilders[player.userID];
+            builder.LobbySpawn = player.transform.position;
+            SendReply(player, $"Lobby spawn set at {builder.LobbySpawn} (radius: {builder.LobbyRadius}m)\n" +
+                             "Use /arena setlobbyradius <radius> to adjust the lobby zone size.");
+            StartBuilderVisualization(player, builder);
+        }
+        
+        private void SetLobbyRadius(BasePlayer player, string radiusArg)
+        {
+            if (!arenaBuilders.ContainsKey(player.userID))
+            {
+                SendReply(player, "You're not in a builder session. Use /arena create <name> or /arena edit <name> first.");
+                return;
+            }
+            
+            float newRadius;
+            if (!float.TryParse(radiusArg, out newRadius) || newRadius <= 0)
+            {
+                SendReply(player, "Invalid radius. Please enter a positive number.");
+                return;
+            }
+            
+            var builder = arenaBuilders[player.userID];
+            builder.LobbyRadius = newRadius;
+            SendReply(player, $"Lobby radius set to {newRadius}m.");
+            if (builder.LobbySpawn != Vector3.zero)
+                StartBuilderVisualization(player, builder);
+        }
+        
+        // Draw ddraw sphere + text label markers for spawn points and the arena zone radius.
+        // Duration is set to just over the refresh interval so visuals never flicker out.
+        private const float VisualizationRefreshInterval = 3f;
+        private const float VisualizationDuration = 3.5f;
+        private const float SpawnMarkerRadius = 0.5f; // DDraw sphere radius for spawn point markers
+        
+        private void DrawArenaBuilderVisuals(BasePlayer player, ArenaBuilder builder)
+        {
+            if (player == null || !player.IsConnected) return;
+            
+            Color spawn1Color = new Color(0f, 1f, 0f);   // green
+            Color spawn2Color = new Color(1f, 0.4f, 0f); // orange
+            Color zoneColor   = new Color(0f, 0.6f, 1f); // cyan
+            Color lobbyColor  = new Color(1f, 1f, 0f);   // yellow
+            
+            if (builder.Spawn1 != Vector3.zero)
+            {
+                // Small sphere at spawn 1 with an elevated text label
+                player.SendConsoleCommand("ddraw.sphere",
+                    VisualizationDuration, spawn1Color, builder.Spawn1, SpawnMarkerRadius);
+                player.SendConsoleCommand("ddraw.text",
+                    VisualizationDuration, spawn1Color,
+                    builder.Spawn1 + Vector3.up * 2f,
+                    $"<size=18>SPAWN 1\n{builder.Spawn1}</size>");
+            }
+            
+            if (builder.Spawn2 != Vector3.zero)
+            {
+                // Small sphere at spawn 2 with an elevated text label
+                player.SendConsoleCommand("ddraw.sphere",
+                    VisualizationDuration, spawn2Color, builder.Spawn2, SpawnMarkerRadius);
+                player.SendConsoleCommand("ddraw.text",
+                    VisualizationDuration, spawn2Color,
+                    builder.Spawn2 + Vector3.up * 2f,
+                    $"<size=18>SPAWN 2\n{builder.Spawn2}</size>");
+            }
+            
+            // Draw the lobby spawn if set
+            if (builder.LobbySpawn != Vector3.zero)
+            {
+                player.SendConsoleCommand("ddraw.sphere",
+                    VisualizationDuration, lobbyColor, builder.LobbySpawn, SpawnMarkerRadius);
+                player.SendConsoleCommand("ddraw.sphere",
+                    VisualizationDuration, lobbyColor, builder.LobbySpawn, builder.LobbyRadius);
+                player.SendConsoleCommand("ddraw.text",
+                    VisualizationDuration, lobbyColor,
+                    builder.LobbySpawn + Vector3.up * (builder.LobbyRadius + 1f),
+                    $"<size=18>LOBBY r={builder.LobbyRadius}m</size>");
+            }
+            
+            // Draw the zone as a sphere centred at the midpoint between the two spawns
+            // (or at spawn1 alone if spawn2 isn't set yet), using the builder's current radius.
+            if (builder.Spawn1 != Vector3.zero)
+            {
+                Vector3 center = builder.Spawn2 != Vector3.zero
+                    ? (builder.Spawn1 + builder.Spawn2) * 0.5f
+                    : builder.Spawn1;
+                float radius = builder.Radius;
+                player.SendConsoleCommand("ddraw.sphere",
+                    VisualizationDuration, zoneColor, center, radius);
+                player.SendConsoleCommand("ddraw.text",
+                    VisualizationDuration, zoneColor,
+                    center + Vector3.up * (radius + 1f),
+                    $"<size=18>{builder.Name}\nZONE r={radius}m</size>");
+            }
+        }
+        
+        private void StartBuilderVisualization(BasePlayer player, ArenaBuilder builder)
+        {
+            StopBuilderVisualization(builder);
+            // Draw immediately and then on every interval
+            DrawArenaBuilderVisuals(player, builder);
+            ulong playerID = player.userID;
+            builder.VisualizationTimer = timer.Every(VisualizationRefreshInterval, () =>
+            {
+                if (!arenaBuilders.ContainsKey(playerID))
+                {
+                    StopBuilderVisualization(builder);
+                    return;
+                }
+                var livePlayer = BasePlayer.FindByID(playerID);
+                if (livePlayer == null || !livePlayer.IsConnected)
+                    return;
+                DrawArenaBuilderVisuals(livePlayer, builder);
+            });
+        }
+        
+        private void StopBuilderVisualization(ArenaBuilder builder)
+        {
+            if (builder.VisualizationTimer != null)
+            {
+                builder.VisualizationTimer.Destroy();
+                builder.VisualizationTimer = null;
+            }
+        }
+        
+        // Draw DDraw markers for all global lobby spawn points so admins can see them in-world.
+        private void DrawLobbySpawnVisuals(BasePlayer player)
+        {
+            if (player == null || !player.IsConnected) return;
+            var spawns = arenaManager.GetLobbySpawnPoints();
+            float radius = arenaManager.GetLobbyRadius();
+            Color spawnColor = new Color(1f, 0.85f, 0f);   // gold
+            Color zoneColor  = new Color(1f, 0.85f, 0f, 0.35f);
+            for (int i = 0; i < spawns.Count; i++)
+            {
+                Vector3 pos = spawns[i];
+                player.SendConsoleCommand("ddraw.sphere", VisualizationDuration, spawnColor, pos, SpawnMarkerRadius);
+                player.SendConsoleCommand("ddraw.sphere", VisualizationDuration, zoneColor, pos, radius);
+                player.SendConsoleCommand("ddraw.text", VisualizationDuration, spawnColor,
+                    pos + Vector3.up * (radius + 1f),
+                    $"<size=18>LOBBY SPAWN {i + 1}\n{pos}</size>");
+            }
+        }
+        
+        // Show lobby spawn visuals once and repeat for a few seconds so the admin can see them.
+        private void ShowLobbySpawnVisuals(BasePlayer player)
+        {
+            DrawLobbySpawnVisuals(player);
+            // Repeat once after the initial draw so the admin has time to look around
+            timer.Once(VisualizationRefreshInterval, () =>
+            {
+                if (player != null && player.IsConnected)
+                    DrawLobbySpawnVisuals(player);
+            });
         }
         
         private void ListArenas(BasePlayer player)
@@ -2872,6 +4748,13 @@ namespace Oxide.Plugins
                 message += $"  Spawn 1: {arena.Spawn1}\n";
                 message += $"  Spawn 2: {arena.Spawn2}\n";
                 message += $"  Zone Radius: {radius}m\n";
+                if (arena.KitOverrides != null && arena.KitOverrides.Count > 0)
+                {
+                    string kitDisplay = arena.KitOverrides.Count == 1
+                        ? $"Kit Override: {arena.KitOverrides[0]}"
+                        : $"Kit Pool ({arena.KitOverrides.Count} random): {string.Join(", ", arena.KitOverrides)}";
+                    message += $"  {kitDisplay}\n";
+                }
                 
                 if (activeInstances > 0)
                 {
@@ -2993,18 +4876,93 @@ namespace Oxide.Plugins
         {
             LoadPlayerData();
             LoadArenas();
+            LoadLobbyData();
         }
         
         private void SaveData()
         {
             SavePlayerData();
+            SaveLobbyData();
+        }
+        
+        private void LoadLobbyData()
+        {
+            try
+            {
+                var data = Interface.Oxide.DataFileSystem.ReadObject<LobbyData>("HellisPlugin_Lobby");
+                if (data != null && data.IsSet)
+                {
+                    // Prefer the new list; fall back to legacy single position for backward compat
+                    if (data.SpawnPoints != null && data.SpawnPoints.Count > 0)
+                    {
+                        arenaManager.SetLobbySpawnPoints(data.SpawnPoints, data.Radius);
+                    }
+                    else
+                    {
+                        arenaManager.SetLobby(data.Position, data.Radius);
+                    }
+                    Puts($"Loaded {arenaManager.GetLobbySpawnPoints().Count} lobby spawn point(s) from data file");
+                }
+            }
+            catch (Exception ex)
+            {
+                Puts($"Error loading lobby data: {ex.Message}");
+            }
+        }
+        
+        private void SaveLobbyData()
+        {
+            try
+            {
+                var spawns = arenaManager.GetLobbySpawnPoints();
+                Interface.Oxide.DataFileSystem.WriteObject("HellisPlugin_Lobby", new LobbyData
+                {
+                    // Persist the full list; keep Position as first entry for backward compat
+                    Position = spawns.Count > 0 ? spawns[0] : Vector3.zero,
+                    SpawnPoints = new List<Vector3>(spawns),
+                    Radius = arenaManager.GetLobbyRadius(),
+                    IsSet = arenaManager.IsLobbySet()
+                });
+            }
+            catch (Exception ex)
+            {
+                Puts($"Error saving lobby data: {ex.Message}");
+            }
+        }
+        
+        private class LobbyData
+        {
+            public Vector3 Position;         // legacy single-point field (kept for backward compat)
+            public List<Vector3> SpawnPoints; // multi-spawn list (preferred)
+            public float Radius = 10f;
+            public bool IsSet;
         }
         
         private void Unload()
         {
+            // Stop all active arena-builder visualization timers
+            foreach (var builder in arenaBuilders.Values)
+                StopBuilderVisualization(builder);
+            arenaBuilders.Clear();
+            
+            // Destroy all UI elements for every connected player before the plugin is unloaded.
+            // Without this, Oxide leaves stale CUI panels on screen permanently.
+            foreach (var player in BasePlayer.activePlayerList)
+            {
+                if (player == null || !player.IsConnected) continue;
+                DestroyLobbyBrowser(player);
+                DestroyLeaderboardUI(player);
+                DestroyJoinButton(player);
+                DestroyLeaveButton(player);
+                DestroyWinLoseUI(player);
+                DestroyJoinRequestUI(player);
+                CuiHelper.DestroyUi(player, "RoomGunSelect");
+            }
+
             // Save all data on plugin unload
             SavePlayerData();
             SaveArenas();
+            SaveLobbyData();
             Puts("HellisPlugin unloaded - all data saved");
         }
         
@@ -3020,13 +4978,8 @@ namespace Oxide.Plugins
             Speargun,
             Bow,
             Revolver,
-            Any  // For random queue matchmaking
-        }
-        
-        private class ModeButton
-        {
-            public string Label { get; set; }
-            public DuelMode Mode { get; set; }
+            Any,    // For random queue matchmaking
+            Custom  // Admin-defined kit loaded by name from config
         }
         
         public class QueueManager
@@ -3065,14 +5018,6 @@ namespace Oxide.Plugins
             public bool IsQueued(ulong playerID)
             {
                 return playerQueues.ContainsKey(playerID);
-            }
-            
-            public int GetQueuePosition(ulong playerID)
-            {
-                if (!playerQueues.ContainsKey(playerID)) return -1;
-                
-                var mode = playerQueues[playerID];
-                return queues[mode].FindIndex(x => x.PlayerID == playerID);
             }
             
             public List<MatchPair> TryMatchAll()
@@ -3135,7 +5080,7 @@ namespace Oxide.Plugins
             
             private DuelMode GetRandomGameMode()
             {
-                // Select random mode for Any queue matches
+                // Select random mode for Any queue matches — Speargun excluded (use dedicated Speargun queue)
                 var availableModes = new List<DuelMode>
                 {
                     DuelMode.AK47,
@@ -3143,9 +5088,6 @@ namespace Oxide.Plugins
                     DuelMode.Bow,
                     DuelMode.Revolver
                 };
-                
-                // Note: Speargun handling would need access to config
-                // For now, only use the 4 standard modes
                 
                 return availableModes[UnityEngine.Random.Range(0, availableModes.Count)];
             }
@@ -3171,6 +5113,10 @@ namespace Oxide.Plugins
             private int maxInstancesPerArena;
             private int lastArenaIndex = -1; // Track last used arena for round-robin distribution
             
+            // Lobby state stored independently of arenas
+            private List<Vector3> lobbySpawnPoints = new List<Vector3>();
+            private float lobbyRadius = 10f;
+            
             public ArenaManager(List<ArenaConfig> configs, int maxInstances = 5)
             {
                 maxInstancesPerArena = maxInstances;
@@ -3186,7 +5132,8 @@ namespace Oxide.Plugins
                         MaxInstances = maxInstances,
                         LobbyPosition = config.LobbyPosition,
                         LobbyRadius = config.LobbyRadius,
-                        LobbyPositionSet = config.LobbyPositionSet
+                        LobbyPositionSet = config.LobbyPositionSet,
+                        KitOverrides = config.KitOverrides != null ? new List<string>(config.KitOverrides) : new List<string>()
                     });
                 }
             }
@@ -3214,13 +5161,6 @@ namespace Oxide.Plugins
                 return null;
             }
             
-            public void ReleaseArena(Arena arena)
-            {
-                // Deprecated - kept for backward compatibility
-                arena.InUse = false;
-                arena.ActiveInstances.Clear();
-            }
-            
             public void ReleaseArenaInstance(Arena arena, int instanceId)
             {
                 arena.ReleaseInstance(instanceId);
@@ -3238,13 +5178,38 @@ namespace Oxide.Plugins
                     MaxInstances = maxInstancesPerArena,
                     LobbyPosition = config.LobbyPosition,
                     LobbyRadius = config.LobbyRadius,
-                    LobbyPositionSet = config.LobbyPositionSet
+                    LobbyPositionSet = config.LobbyPositionSet,
+                    KitOverrides = config.KitOverrides != null ? new List<string>(config.KitOverrides) : new List<string>()
                 });
             }
             
             public void RemoveArena(string name)
             {
                 arenas.RemoveAll(a => a.Name == name);
+            }
+            
+            // Update an existing live Arena object in place from an ArenaConfig (used by /arena edit + save).
+            public void UpdateArena(ArenaConfig config)
+            {
+                var arena = arenas.FirstOrDefault(a =>
+                    a.Name.Equals(config.Name, StringComparison.OrdinalIgnoreCase));
+                if (arena == null) return;
+                arena.Spawn1 = config.Spawn1;
+                arena.Spawn2 = config.Spawn2;
+                arena.Radius = config.Radius;
+                arena.LobbyPosition = config.LobbyPosition;
+                arena.LobbyRadius = config.LobbyRadius;
+                arena.LobbyPositionSet = config.LobbyPositionSet;
+                arena.KitOverrides = config.KitOverrides != null ? new List<string>(config.KitOverrides) : new List<string>();
+            }
+            
+            // Update the kit override list on a live Arena object (called by /arena setkit, addkit, removekit, clearkit).
+            public void SetArenaKitOverrides(string arenaName, List<string> kitOverrides)
+            {
+                var arena = arenas.FirstOrDefault(a =>
+                    a.Name.Equals(arenaName, StringComparison.OrdinalIgnoreCase));
+                if (arena != null)
+                    arena.KitOverrides = kitOverrides != null ? new List<string>(kitOverrides) : new List<string>();
             }
             
             public bool ArenaExists(string name)
@@ -3269,33 +5234,64 @@ namespace Oxide.Plugins
             }
             
             // Lobby helper methods
-            public Vector3 GetLobbyPosition()
+            public Vector3 GetLobbyPosition() => lobbySpawnPoints.Count > 0 ? lobbySpawnPoints[0] : Vector3.zero;
+            
+            public Vector3 GetRandomLobbySpawn()
             {
-                // Get lobby from first arena (or default if none)
-                return arenas.Count > 0 && arenas[0].LobbyPositionSet 
-                    ? arenas[0].LobbyPosition 
-                    : Vector3.zero;
+                if (lobbySpawnPoints.Count == 0) return Vector3.zero;
+                if (lobbySpawnPoints.Count == 1) return lobbySpawnPoints[0];
+                return lobbySpawnPoints[UnityEngine.Random.Range(0, lobbySpawnPoints.Count)];
             }
             
-            public float GetLobbyRadius()
-            {
-                // Get lobby radius from first arena (or default)
-                return arenas.Count > 0 ? arenas[0].LobbyRadius : 10f;
-            }
+            public List<Vector3> GetLobbySpawnPoints() => lobbySpawnPoints;
             
-            public bool IsLobbySet()
-            {
-                return arenas.Count > 0 && arenas[0].LobbyPositionSet;
-            }
+            public float GetLobbyRadius() => lobbyRadius;
             
+            public bool IsLobbySet() => lobbySpawnPoints.Count > 0;
+            
+            // Set (or replace) spawn point 1 — used by /lobby setpos and legacy load path
             public void SetLobby(Vector3 position, float radius)
             {
-                // Set lobby for first arena (ensure at least one arena exists)
-                if (arenas.Count == 0) return;
-                
-                arenas[0].LobbyPosition = position;
-                arenas[0].LobbyRadius = radius;
-                arenas[0].LobbyPositionSet = true;
+                lobbyRadius = radius;
+                if (lobbySpawnPoints.Count == 0)
+                    lobbySpawnPoints.Add(position);
+                else
+                    lobbySpawnPoints[0] = position;
+            }
+            
+            // Set radius without touching spawn points — used by /lobby setradius
+            public void SetLobbyRadius(float radius)
+            {
+                lobbyRadius = radius;
+            }
+            
+            // Add an additional spawn point — used by /lobby addspawn
+            public void AddLobbySpawn(Vector3 position)
+            {
+                lobbySpawnPoints.Add(position);
+            }
+            
+            // Remove a spawn point by index; returns false if index is out of range
+            public bool RemoveLobbySpawn(int index)
+            {
+                if (index < 0 || index >= lobbySpawnPoints.Count) return false;
+                lobbySpawnPoints.RemoveAt(index);
+                return true;
+            }
+            
+            // Replace the entire list — used when loading persisted data
+            public void SetLobbySpawnPoints(List<Vector3> points, float radius)
+            {
+                lobbySpawnPoints = points != null ? new List<Vector3>(points) : new List<Vector3>();
+                lobbyRadius = radius;
+            }
+            
+            // Replace an existing spawn point in-place; returns false if index is out of range
+            public bool EditLobbySpawn(int index, Vector3 position)
+            {
+                if (index < 0 || index >= lobbySpawnPoints.Count) return false;
+                lobbySpawnPoints[index] = position;
+                return true;
             }
         }
         
@@ -3313,6 +5309,18 @@ namespace Oxide.Plugins
             public Vector3 LobbyPosition;
             public float LobbyRadius = 10f;
             public bool LobbyPositionSet;
+            
+            // When non-empty, each match in this arena randomly selects one kit from this list.
+            // Empty list means use the mode-based global kit.
+            public List<string> KitOverrides = new List<string>();
+            
+            // Picks a random kit from KitOverrides; returns null if the list is empty.
+            public string PickRandomKitOverride()
+            {
+                if (KitOverrides == null || KitOverrides.Count == 0) return null;
+                if (KitOverrides.Count == 1) return KitOverrides[0];
+                return KitOverrides[UnityEngine.Random.Range(0, KitOverrides.Count)];
+            }
             
             public Arena()
             {
@@ -3352,6 +5360,8 @@ namespace Oxide.Plugins
         public class LoadoutManager
         {
             private Dictionary<DuelMode, Loadout> loadouts = new Dictionary<DuelMode, Loadout>();
+            // All loadouts keyed by config name, including custom modes.
+            private Dictionary<string, Loadout> namedLoadouts = new Dictionary<string, Loadout>();
             
             public LoadoutManager(Configuration config)
             {
@@ -3373,25 +5383,42 @@ namespace Oxide.Plugins
                 
                 foreach (var kvp in config.Loadouts)
                 {
+                    var loadout = new Loadout
+                    {
+                        Items = kvp.Value.Items.Select(item => new LoadoutItem
+                        {
+                            ShortName = item.ShortName,
+                            Amount = item.Amount,
+                            SkinID = item.SkinID
+                        }).ToList()
+                    };
+                    
                     if (modeMap.TryGetValue(kvp.Key, out var mode))
                     {
-                        var loadout = new Loadout
-                        {
-                            Items = kvp.Value.Items.Select(item => new LoadoutItem
-                            {
-                                ShortName = item.ShortName,
-                                Amount = item.Amount
-                            }).ToList()
-                        };
-                        
                         loadouts[mode] = loadout;
                     }
+                    // All loadout names (including custom ones) are stored in namedLoadouts.
+                    namedLoadouts[kvp.Key] = loadout;
                 }
             }
             
             public Loadout GetLoadout(DuelMode mode)
             {
                 return loadouts.ContainsKey(mode) ? loadouts[mode] : new Loadout();
+            }
+            
+            // Look up a loadout by its config key (used for custom modes).
+            public Loadout GetLoadoutByName(string name)
+            {
+                return namedLoadouts.ContainsKey(name) ? namedLoadouts[name] : new Loadout();
+            }
+            
+            // Re-read loadouts from config after an in-game kit change.
+            public void Reload(Configuration config)
+            {
+                loadouts.Clear();
+                namedLoadouts.Clear();
+                LoadLoadoutsFromConfig(config);
             }
         }
         
@@ -3419,6 +5446,14 @@ namespace Oxide.Plugins
             public int Player1Score = 0;
             public int Player2Score = 0;
             public bool RoundInProgress = false;
+            public string RoomID = null; // Non-null if this match was started from a private room
+            public QueueType? SourceQueueType = null; // Non-null for Phase 3 public queue matches
+            public string CustomModeName = null; // Non-null when Mode == DuelMode.Custom
+            // Kit picked randomly from Arena.KitOverrides at match start; null means use mode-based kit.
+            // Fixed for the entire match so all rounds use the same kit.
+            public string ResolvedArenaKit = null;
+            // Entities placed during this match (walls, deployables, etc.) — killed between rounds and on match end.
+            public List<BaseEntity> SpawnedEntities = new List<BaseEntity>();
             
             public ActiveMatch(ulong p1, ulong p2, DuelMode mode, Arena arena, int instanceId, int bestOf)
             {
@@ -3481,6 +5516,9 @@ namespace Oxide.Plugins
             
             [JsonProperty("Timestamp")]
             public DateTime Timestamp;
+            
+            [JsonProperty("QueueKey")]
+            public string QueueKey = "";  // empty string for legacy events without queue context
         }
         
         public class PlayerData
@@ -3495,6 +5533,10 @@ namespace Oxide.Plugins
             public float WinRate = 0f;
             public DateTime LastMatchTime = DateTime.MinValue;
             
+            // Per-queue-type win/loss counts (keys: "Public", "AK", "Bow", "Speargun", "Private")
+            public Dictionary<string, int> WinsByQueue = new Dictionary<string, int>();
+            public Dictionary<string, int> LossesByQueue = new Dictionary<string, int>();
+            
             // Event-based stats for rolling leaderboard
             public List<StatEvent> StatEvents = new List<StatEvent>();
         }
@@ -3508,10 +5550,6 @@ namespace Oxide.Plugins
                 sessions[playerID] = new AimTrainSession { PlayerID = playerID };
             }
             
-            public void EndSession(ulong playerID)
-            {
-                sessions.Remove(playerID);
-            }
         }
         
         public class AimTrainSession
@@ -3526,16 +5564,22 @@ namespace Oxide.Plugins
             public string Name;
             public Vector3 Spawn1 = Vector3.zero;
             public Vector3 Spawn2 = Vector3.zero;
+            public float Radius = 30f;
+            public Vector3 LobbySpawn = Vector3.zero;
+            public float LobbyRadius = 10f;
+            // True when editing an existing arena rather than creating a new one.
+            public bool IsEditing = false;
+            // Repeating timer that refreshes ddraw visuals for this builder session.
+            public Oxide.Plugins.Timer VisualizationTimer;
         }
         
         // Queue types for lobby browser
         public enum QueueType
         {
-            Public,         // Any mode, random
-            PublicAK,       // AK47 only
-            PublicSAR,      // SAR only
-            PublicBow,      // Bow only
-            PublicRevolver  // Revolver only
+            Public,           // Any mode, random (AK47, SAR, Bow, Revolver)
+            PublicAK,         // AK47 only
+            PublicBow,        // Bow only
+            PublicSpeargun    // Speargun only
         }
         
         // Private room data structure
@@ -3545,9 +5589,11 @@ namespace Oxide.Plugins
             public string RoomName;
             public ulong OwnerID;
             public string OwnerName;
-            public List<ulong> PlayerIDs = new List<ulong>();
-            public int MaxPlayers = 2;
-            public DuelMode Mode;
+            public List<ulong> PlayerIDs = new List<ulong>();         // All players currently in the room
+            public List<ulong> WaitingQueue = new List<ulong>();      // Players waiting for a 1v1 match
+            public Dictionary<ulong, string> PendingRequests = new Dictionary<ulong, string>(); // requesterID -> displayName
+            public DuelMode Mode = DuelMode.AK47;
+            public string CustomModeName = null; // Non-null when Mode == DuelMode.Custom
             public DateTime Created;
             public bool IsOpen = true;
             
@@ -3557,15 +5603,8 @@ namespace Oxide.Plugins
                 Created = DateTime.Now;
             }
             
-            public bool IsFull()
-            {
-                return PlayerIDs.Count >= MaxPlayers;
-            }
-            
-            public bool HasPlayer(ulong playerID)
-            {
-                return PlayerIDs.Contains(playerID);
-            }
+            public bool HasPlayer(ulong playerID) => PlayerIDs.Contains(playerID);
+            public bool HasPendingRequest(ulong playerID) => PendingRequests.ContainsKey(playerID);
         }
         
         #endregion
